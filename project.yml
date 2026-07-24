@@ -1,0 +1,22 @@
+name: LoopFlow
+options:
+  bundleIdPrefix: com.loopflow
+  deploymentTarget:
+    iOS: "17.0"
+  xcodeVersion: "16.0"
+settings:
+  SWIFT_VERSION: "5.0"
+  TARGETED_DEVICE_FAMILY: "1"
+targets:
+  LoopFlow:
+    type: application
+    platform: iOS
+    sources:
+      - path: LoopFlow
+    settings:
+      INFOPLIST_FILE: LoopFlow/Resources/Info.plist
+      PRODUCT_BUNDLE_IDENTIFIER: com.loopflow.app
+      GENERATE_INFOPLIST_FILE: false
+    dependencies:
+      - sdk: AVFoundation.framework
+      - sdk: GameController.framework

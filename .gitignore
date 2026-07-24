@@ -1,0 +1,23 @@
+# Xcode
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
+*.xccheckout
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# macOS
+.DS_Store
+
+# App data
+*.mov
+*.wav
+*.mp3
+!Fixtures/**
+
+# Cursor
+.cursor/
