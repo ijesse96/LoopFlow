@@ -120,18 +120,27 @@ final class ExportManager {
 
         if includeInstrumental, let relative = project.instrumentalTrack?.audioRelativePath {
             let url = storage.absoluteURL(for: relative, projectID: project.id)
-            try mixFile(url, into: outputBuffer, at: 0, gain: project.instrumentalTrack?.volume ?? 0.8, format: format)
+            try mixFile(
+                url,
+                into: outputBuffer,
+                at: 0,
+                gain: project.instrumentalTrack?.volume ?? 0.8,
+                pan: project.instrumentalTrack?.pan ?? 0,
+                format: format
+            )
         }
 
         for clip in clips {
             let start = project.beatsToSeconds(clip.timelineStartBeats)
             let url = storage.absoluteURL(for: clip.sourceRelativePath, projectID: project.id)
-            let trackGain = project.tracks.first(where: { $0.id == clip.trackId })?.volume ?? 1
+            let track = project.tracks.first(where: { $0.id == clip.trackId })
+            let trackGain = track?.volume ?? 1
             try mixFile(
                 url,
                 into: outputBuffer,
                 at: start,
                 gain: trackGain * clip.gain,
+                pan: track?.pan ?? 0,
                 format: format,
                 sourceStart: clip.sourceStartSeconds,
                 sourceEnd: clip.sourceEndSeconds
@@ -150,6 +159,7 @@ final class ExportManager {
         into output: AVAudioPCMBuffer,
         at startSeconds: Double,
         gain: Float,
+        pan: Float = 0,
         format: AVAudioFormat,
         sourceStart: Double = 0,
         sourceEnd: Double? = nil
@@ -197,12 +207,16 @@ final class ExportManager {
         let inR = converted.format.channelCount > 1 ? converted.floatChannelData![1] : inL
         let count = Int(converted.frameLength)
         let outCount = Int(output.frameLength)
+        let clampedPan = max(-1, min(1, pan))
+        let angle = (clampedPan + 1) * Float.pi / 4
+        let leftGain = gain * cos(angle)
+        let rightGain = gain * sin(angle)
 
         for i in 0..<count {
             let dest = destStart + i
             guard dest >= 0, dest < outCount else { continue }
-            outL[dest] += inL[i] * gain
-            outR[dest] += inR[i] * gain
+            outL[dest] += inL[i] * leftGain
+            outR[dest] += inR[i] * rightGain
         }
     }
 

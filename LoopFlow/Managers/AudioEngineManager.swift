@@ -10,6 +10,8 @@ struct ScheduledClip: Equatable {
     var sourceEndSeconds: Double
     var timelineStartSeconds: Double
     var gain: Float
+    /// Track pan −1…1 (left…right).
+    var pan: Float
 }
 
 @MainActor
@@ -30,6 +32,7 @@ final class AudioEngineManager: ObservableObject {
 
     private var desiredMonitorEnabled = false
     private var desiredMonitorVolume: Float = 0
+    private var desiredMonitorPan: Float = 0
     private var wantsInputMetering = false
     private var routeObserver: NSObjectProtocol?
     private var interruptionObserver: NSObjectProtocol?
@@ -389,15 +392,20 @@ final class AudioEngineManager: ObservableObject {
         instrumentalMixer.outputVolume = max(0, min(1, volume))
     }
 
+    func setInstrumentalPan(_ pan: Float) {
+        instrumentalMixer.pan = max(-1, min(1, pan))
+    }
+
     func setMetronomeVolume(_ enabled: Bool) {
         metronomeEnabled = enabled
         metronomeMixer.outputVolume = enabled ? 0.55 : 0
     }
 
     /// Live mic → headphones/BT via hardware passthrough (input → micSplitter → vocalMonitorMixer).
-    func setInputMonitor(enabled: Bool, volume: Float) {
+    func setInputMonitor(enabled: Bool, volume: Float, pan: Float = 0) {
         desiredMonitorEnabled = enabled
         desiredMonitorVolume = max(0, min(1, volume))
+        desiredMonitorPan = max(-1, min(1, pan))
         refreshRouteState()
         applyDesiredMonitor()
     }
@@ -436,6 +444,7 @@ final class AudioEngineManager: ObservableObject {
                 ? (desiredMonitorVolume > 0.001 ? desiredMonitorVolume : 0.55)
                 : desiredMonitorVolume
             vocalMonitorMixer.outputVolume = recordingMonitor ? max(0.05, volume) : volume
+            vocalMonitorMixer.pan = desiredMonitorPan
             _ = ensureEngineRunning()
         } else {
             vocalMonitorMixer.outputVolume = 0
@@ -928,6 +937,7 @@ final class AudioEngineManager: ObservableObject {
             }
 
             player.volume = max(0, min(1, clip.gain))
+            player.pan = max(-1, min(1, clip.pan))
             clipPlayerSourceURLs[playerIndex] = clip.url
             player.scheduleSegment(
                 file,

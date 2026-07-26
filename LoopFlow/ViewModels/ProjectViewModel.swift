@@ -119,13 +119,19 @@ final class ProjectViewModel: ObservableObject {
     func handleControllerAction(_ action: ControllerAction) {
         switch action {
         case .keepTake:
+            let wasRecording = recording.phase == .loopRecording
             let before = project
             let ok = recording.keepTake(advance: false, project: &project)
             if ok {
                 editHistory.push(before)
-                // While armed the record track is already excluded — rebuilding the
-                // schedule under a live mic causes monitor static.
-                if recording.phase != .loopRecording {
+                if wasRecording {
+                    // Stopped for review — rebuild schedule so the kept clip is audible,
+                    // then play from the top of the current region (recording disarmed).
+                    applyAudioFromProject()
+                    applyInputMonitor()
+                    audio.setActiveRegion(project.currentRegion, resetPlayhead: true)
+                    try? audio.play(fromRegionStart: true, armRecordingOnStart: false)
+                } else if recording.phase != .loopRecording {
                     refreshClipPlaybackSchedule()
                 }
                 autosave()
@@ -315,6 +321,18 @@ final class ProjectViewModel: ObservableObject {
         timelineInteraction.requestScrollPlayheadIntoView()
     }
 
+    /// Slide the loop selection by one full region (or 1 bar when length is 1).
+    /// Parks the playhead on the new loop start and scrolls it into view (same mechanic as playhead scrub).
+    func nudgeLoopSelection(byBars bars: Int) {
+        guard recording.phase == .idle, bars != 0 else { return }
+        // Step by loop length (2/4/8); 1-bar regions still nudge one bar at a time.
+        let step = max(1, project.regionLength.rawValue)
+        moveLoopSelection(toStartBar: project.selectionStartBar + bars * step)
+        let startBeats = project.barToBeats(project.selectionStartBar)
+        audio.scrub(to: project.beatsToSeconds(startBeats))
+        timelineInteraction.requestScrollPlayheadIntoView()
+    }
+
     // MARK: - Import
 
     var importTypes: [UTType] {
@@ -406,8 +424,10 @@ final class ProjectViewModel: ObservableObject {
         }
         if let inst = project.instrumentalTrack {
             audio.setInstrumentalVolume(inst.isMuted ? 0 : inst.volume)
+            audio.setInstrumentalPan(inst.pan)
         } else {
             audio.setInstrumentalVolume(0)
+            audio.setInstrumentalPan(0)
         }
         refreshInstrumentalMapping()
         refreshClipPlaybackSchedule()
@@ -456,7 +476,8 @@ final class ProjectViewModel: ObservableObject {
                         sourceStartSeconds: clip.sourceStartSeconds,
                         sourceEndSeconds: clip.sourceEndSeconds,
                         timelineStartSeconds: project.beatsToSeconds(clip.timelineStartBeats),
-                        gain: track.volume * clip.gain
+                        gain: track.volume * clip.gain,
+                        pan: track.pan
                     )
                 )
             }
@@ -627,6 +648,7 @@ final class ProjectViewModel: ObservableObject {
         project.tracks[idx] = next
         if next.type == .instrumental {
             audio.setInstrumentalVolume(next.isMuted ? 0 : next.volume)
+            audio.setInstrumentalPan(next.pan)
         }
         applyInputMonitor()
         refreshClipPlaybackSchedule()
@@ -688,11 +710,15 @@ final class ProjectViewModel: ObservableObject {
             $0.inputMonitorEnabled && ($0.type == .vocal || $0.type == .audio)
         })
         audio.setInputMeteringEnabled(monitoringTrack != nil)
-        guard let track = monitoringTrack else {
-            audio.setInputMonitor(enabled: false, volume: 0)
+        if let track = monitoringTrack {
+            audio.setInputMonitor(enabled: !track.isMuted, volume: track.volume, pan: track.pan)
             return
         }
-        audio.setInputMonitor(enabled: !track.isMuted, volume: track.volume)
+        // I off: still pass selected track mix so recording auto-monitor can use volume/pan.
+        let fallback = project.tracks.first(where: {
+            $0.id == project.selectedTrackId && ($0.type == .vocal || $0.type == .audio)
+        })
+        audio.setInputMonitor(enabled: false, volume: fallback?.volume ?? 0, pan: fallback?.pan ?? 0)
     }
 
     func selectTrack(id: UUID) {
@@ -908,6 +934,15 @@ final class ProjectViewModel: ObservableObject {
         recording.syncSelection(from: project)
         applyAudioFromProject()
         autosave()
+    }
+
+    /// Cycle loop length preset: 1 → 2 → 4 → 8 → 1.
+    func cycleRegionLength() {
+        guard recording.phase == .idle else { return }
+        let cases = RegionLength.allCases
+        guard let idx = cases.firstIndex(of: project.regionLength) else { return }
+        let next = cases[(idx + 1) % cases.count]
+        applyRegionPreset(next)
     }
 
     func setLoopEnabled(_ enabled: Bool) {

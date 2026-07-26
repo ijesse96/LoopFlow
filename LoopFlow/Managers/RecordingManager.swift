@@ -155,6 +155,7 @@ final class RecordingManager: ObservableObject {
         audio.setMasterVolume(project.masterVolume)
         if let inst = project.instrumentalTrack {
             audio.setInstrumentalVolume(inst.isMuted ? 0 : inst.volume)
+            audio.setInstrumentalPan(inst.pan)
         }
         audio.setLoopBoundaryHandler { [weak self] in
             self?.handleLoopBoundary()
@@ -274,6 +275,7 @@ final class RecordingManager: ObservableObject {
         audio.setMasterVolume(project.masterVolume)
         if let inst = project.instrumentalTrack {
             audio.setInstrumentalVolume(inst.isMuted ? 0 : inst.volume)
+            audio.setInstrumentalPan(inst.pan)
         }
         audio.setLoopBoundaryHandler(nil)
         try? audio.play(fromRegionStart: false)
@@ -518,14 +520,18 @@ final class RecordingManager: ObservableObject {
             ? "Kept take \(chosen.takeNumber) — replaced previous (Undo to restore)"
             : "Kept take \(chosen.takeNumber)"
 
-        // Re-arm recording before peak generation so monitor stays live.
         if advance {
+            // Keep+Next: advance and keep recording when still armed.
             advanceRegion(project: &project, continueRecording: phase == .loopRecording)
         } else if phase == .loopRecording {
-            currentTakeNumber = nextTakeNumber(in: project)
-            openNewTakeFile()
-            // Same-region Keep: clock never stopped — re-arm writes immediately.
-            audio.armRecordingWritesAlignedToClock()
+            // Keep (same region): stop recording so the VM can play back for review.
+            audio.setRecordingPunchInHandler(nil)
+            audio.stop()
+            audio.setLoopBoundaryHandler(nil)
+            phase = .idle
+            statusMessage = hadExistingClip
+                ? "Kept take \(chosen.takeNumber) — replaced previous · review"
+                : "Kept take \(chosen.takeNumber) — playing review"
         }
 
         if let takeURL {

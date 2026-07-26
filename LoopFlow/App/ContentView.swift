@@ -163,6 +163,48 @@ struct ContentView: View {
                     vm.nudgePlayhead(byBars: 1)
                 }
             }
+            HStack(spacing: 12) {
+                HoldRepeatIconButton(
+                    systemName: "chevron.backward",
+                    fill: AppTheme.surfaceElevated,
+                    foreground: AppTheme.textPrimary,
+                    disabled: scrubDisabled
+                ) {
+                    vm.nudgeLoopSelection(byBars: -1)
+                }
+                HStack(spacing: 6) {
+                    bottomBarButton(
+                        title: vm.recording.phase == .idle ? "Record" : "Stop",
+                        fill: vm.recording.phase == .idle ? AppTheme.record : AppTheme.surfaceElevated,
+                        foreground: vm.recording.phase == .idle ? .white : AppTheme.textPrimary
+                    ) {
+                        vm.toggleRecord()
+                    }
+                    Button {
+                        vm.cycleRegionLength()
+                    } label: {
+                        Text("\(vm.project.regionLength.rawValue)")
+                            .font(.subheadline.weight(.semibold))
+                            .frame(width: 52)
+                            .padding(.vertical, 12)
+                            .background(AppTheme.surfaceElevated)
+                            .foregroundStyle(AppTheme.textPrimary)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                            .opacity(scrubDisabled ? 0.45 : 1)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(scrubDisabled)
+                }
+                .frame(maxWidth: .infinity)
+                HoldRepeatIconButton(
+                    systemName: "chevron.forward",
+                    fill: AppTheme.surfaceElevated,
+                    foreground: AppTheme.textPrimary,
+                    disabled: scrubDisabled
+                ) {
+                    vm.nudgeLoopSelection(byBars: 1)
+                }
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
