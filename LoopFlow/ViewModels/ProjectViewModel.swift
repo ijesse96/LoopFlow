@@ -1324,12 +1324,18 @@ final class ProjectViewModel: ObservableObject {
     private func share(urls: [URL]) {
         guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
               let root = scene.windows.first?.rootViewController else { return }
+        // Present from the topmost VC — Export is already a sheet on root, so
+        // presenting on root silently fails.
+        var presenter = root
+        while let presented = presenter.presentedViewController {
+            presenter = presented
+        }
         let vc = UIActivityViewController(activityItems: urls, applicationActivities: nil)
         if let pop = vc.popoverPresentationController {
-            pop.sourceView = root.view
-            pop.sourceRect = CGRect(x: root.view.bounds.midX, y: root.view.bounds.midY, width: 0, height: 0)
+            pop.sourceView = presenter.view
+            pop.sourceRect = CGRect(x: presenter.view.bounds.midX, y: presenter.view.bounds.midY, width: 0, height: 0)
         }
-        root.present(vc, animated: true)
+        presenter.present(vc, animated: true)
     }
 
     // MARK: - Timeline helpers
