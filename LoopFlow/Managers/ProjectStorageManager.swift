@@ -1,6 +1,14 @@
 import Foundation
 import AVFoundation
 
+struct ProjectSummary: Identifiable, Equatable {
+    let id: UUID
+    let name: String
+    let bpm: Double
+    let createdAt: Date
+    let updatedAt: Date
+}
+
 @MainActor
 final class ProjectStorageManager {
     static let shared = ProjectStorageManager()
@@ -68,7 +76,45 @@ final class ProjectStorageManager {
     }
 
     func absoluteURL(for relativePath: String, projectID: UUID) -> URL {
-        projectDirectory(for: projectID).appendingPathComponent(relativePath)
+        relativePath
+            .split(separator: "/")
+            .filter { !$0.isEmpty }
+            .reduce(projectDirectory(for: projectID)) { partial, component in
+                partial.appendingPathComponent(String(component))
+            }
+    }
+
+    /// Locate the instrumental audio file, repairing stale relative paths when possible.
+    /// Tries track path → first clip path → scan `Audio/instrumental.*`.
+    func resolveInstrumentalURL(project: LoopFlowProject) -> (url: URL, relativePath: String)? {
+        var candidates: [String] = []
+        if let relative = project.instrumentalTrack?.audioRelativePath, !relative.isEmpty {
+            candidates.append(relative)
+        }
+        if let clipPath = project.instrumentalTrack?.clips.first?.sourceRelativePath, !clipPath.isEmpty {
+            candidates.append(clipPath)
+        }
+        for relative in candidates {
+            let url = absoluteURL(for: relative, projectID: project.id)
+            if fileManager.fileExists(atPath: url.path) {
+                return (url, relative)
+            }
+        }
+
+        let audioDir = audioDirectory(for: project.id)
+        guard let contents = try? fileManager.contentsOfDirectory(
+            at: audioDir,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return nil }
+
+        let match = contents.first { url in
+            url.isFileURL
+                && url.deletingPathExtension().lastPathComponent.lowercased() == "instrumental"
+        }
+        guard let found = match else { return nil }
+        let relative = "Audio/\(found.lastPathComponent)"
+        return (found, relative)
     }
 
     func importInstrumental(from sourceURL: URL, projectID: UUID) throws -> (relativePath: String, duration: Double) {
@@ -110,6 +156,31 @@ final class ProjectStorageManager {
             includingPropertiesForKeys: nil
         ) else { return [] }
         return contents.compactMap { UUID(uuidString: $0.lastPathComponent) }
+    }
+
+    func listProjectSummaries() -> [ProjectSummary] {
+        listProjectIDs().compactMap { id -> ProjectSummary? in
+            guard let project = try? load(projectID: id) else { return nil }
+            return ProjectSummary(
+                id: project.id,
+                name: project.name,
+                bpm: project.bpm,
+                createdAt: project.createdAt,
+                updatedAt: project.updatedAt
+            )
+        }
+        .sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    func delete(projectID: UUID) throws {
+        let directory = projectDirectory(for: projectID)
+        if fileManager.fileExists(atPath: directory.path) {
+            try fileManager.removeItem(at: directory)
+        }
+        if loadLastOpenedID() == projectID,
+           fileManager.fileExists(atPath: lastOpenedURL.path) {
+            try fileManager.removeItem(at: lastOpenedURL)
+        }
     }
 
     // MARK: - Last opened

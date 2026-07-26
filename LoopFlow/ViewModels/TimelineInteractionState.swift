@@ -9,6 +9,12 @@ final class TimelineInteractionState: ObservableObject {
     @Published var pinchAnchorBeats: Double?
     /// Playhead position (beats) remembered when opening the clip editor for Split.
     @Published var splitAnchorBeats: Double?
+    /// Bumped to ask the arrange view to scroll the playhead on-screen (nudge/scrub).
+    @Published private(set) var playheadScrollToken: UInt = 0
+
+    func requestScrollPlayheadIntoView() {
+        playheadScrollToken &+= 1
+    }
 
     /// Minimum / maximum pixels per bar for zoom.
     static let minPixelsPerBar: CGFloat = 16

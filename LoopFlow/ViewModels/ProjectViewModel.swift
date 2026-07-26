@@ -7,6 +7,8 @@ import Combine
 @MainActor
 final class ProjectViewModel: ObservableObject {
     @Published var project: LoopFlowProject
+    @Published var isInStudio = false
+    @Published var sessionSummaries: [ProjectSummary] = []
     @Published var showImporter = false
     @Published var showSettings = false
     @Published var showExport = false
@@ -58,9 +60,8 @@ final class ProjectViewModel: ObservableObject {
             }
         }
         applyInputMonitor()
-        if project.instrumentalTrack?.audioRelativePath == nil {
-            showSetupSheet = true
-        }
+        isInStudio = false
+        refreshSessionSummaries()
     }
 
     private func forwardChildChanges() {
@@ -122,34 +123,54 @@ final class ProjectViewModel: ObservableObject {
             let ok = recording.keepTake(advance: false, project: &project)
             if ok {
                 editHistory.push(before)
-                refreshClipPlaybackSchedule()
+                // While armed the record track is already excluded — rebuilding the
+                // schedule under a live mic causes monitor static.
+                if recording.phase != .loopRecording {
+                    refreshClipPlaybackSchedule()
+                }
                 autosave()
             }
         case .keepTakeAndNext:
+            let wasRecording = recording.phase == .loopRecording
             let before = project
             let ok = recording.keepTake(advance: true, project: &project)
             if ok {
                 editHistory.push(before)
                 recording.syncSelection(from: project)
-                // While still recording, avoid full audio reload (session/mic churn → monitor static).
                 if recording.phase == .loopRecording {
-                    audio.setActiveRegion(project.currentRegion, resetPlayhead: false)
+                    // Still armed — region/file already rotated in RecordingManager.
+                    // Do not rebuild clip graph or reload audio (monitor static).
                     audio.setArrangementEndSeconds(RecordingManager.arrangementEndSeconds(for: project))
-                    refreshClipPlaybackSchedule()
-                } else {
+                } else if wasRecording {
+                    // Hit last region / stopped during keep — settle idle monitor.
                     applyAudioFromProject()
+                    applyInputMonitor()
+                } else {
+                    // Idle Keep+Next: advance then auto-arm record on the new region.
+                    applyAudioFromProject()
+                    requestMicAndRecord(leadIn: false)
                 }
                 autosave()
             }
         case .previousRegion:
             recording.previousRegion(project: &project)
             recording.syncSelection(from: project)
-            applyAudioFromProject()
+            if recording.phase == .loopRecording {
+                audio.setActiveRegion(project.currentRegion, resetPlayhead: false)
+                audio.setArrangementEndSeconds(RecordingManager.arrangementEndSeconds(for: project))
+            } else {
+                applyAudioFromProject()
+            }
             autosave()
         case .nextRegion:
             recording.nextRegion(project: &project)
             recording.syncSelection(from: project)
-            applyAudioFromProject()
+            if recording.phase == .loopRecording {
+                audio.setActiveRegion(project.currentRegion, resetPlayhead: false)
+                audio.setArrangementEndSeconds(RecordingManager.arrangementEndSeconds(for: project))
+            } else {
+                applyAudioFromProject()
+            }
             autosave()
         case .redoRegion:
             pushUndo()
@@ -159,6 +180,8 @@ final class ProjectViewModel: ObservableObject {
             performUndo()
         case .record:
             toggleRecord()
+        case .leadIn:
+            startLeadInRecord()
         case .stop:
             recording.stop()
             applyInputMonitor()
@@ -178,7 +201,7 @@ final class ProjectViewModel: ObservableObject {
                 recording.statusMessage = "Select a vocal/audio track to record"
                 return
             }
-            requestMicAndRecord()
+            requestMicAndRecord(leadIn: false)
         } else {
             recording.stop()
             applyInputMonitor()
@@ -186,16 +209,33 @@ final class ProjectViewModel: ObservableObject {
         }
     }
 
-    private func requestMicAndRecord() {
+    func startLeadInRecord() {
+        guard recording.phase == .idle else { return }
+        if let track = project.selectedTrack, track.type == .instrumental {
+            recording.statusMessage = "Select a vocal/audio track to record"
+            return
+        }
+        if project.recordingTrackIndex == nil {
+            recording.statusMessage = "Select a vocal/audio track to record"
+            return
+        }
+        requestMicAndRecord(leadIn: true)
+    }
+
+    private func requestMicAndRecord(leadIn: Bool) {
         AVAudioSession.sharedInstance().requestRecordPermission { [weak self] granted in
             Task { @MainActor in
                 guard let self else { return }
                 if granted {
                     self.recording.configure(projectID: self.project.id)
                     self.recording.syncSelection(from: self.project)
-                    self.recording.startRecording(project: self.project)
-                    // Refresh after phase is armed so the record-track take is not scheduled.
-                    self.refreshClipPlaybackSchedule()
+                    if leadIn {
+                        self.recording.startLeadInRecording(project: self.project)
+                    } else {
+                        self.recording.startRecording(project: self.project)
+                    }
+                    // Schedule exclude already ran inside beginLoopRecording / lead-in.
+                    // Do not refresh again under a live mic.
                 } else {
                     self.recording.statusMessage = "Microphone permission denied"
                 }
@@ -234,11 +274,45 @@ final class ProjectViewModel: ObservableObject {
     func scrubPlayhead(toBeats beats: Double) {
         let clampedBeats = max(0, beats)
         let seconds = project.beatsToSeconds(clampedBeats)
-        audio.scrub(to: seconds)
+        // Playhead is independent of the loop segment except during an active take.
+        if recording.phase == .loopRecording, project.loopEnabled {
+            audio.seekPlayhead(to: seconds, clampToLoop: true)
+        } else {
+            audio.scrub(to: seconds)
+        }
     }
 
     func scrubPlayhead(toX x: CGFloat) {
         scrubPlayhead(toBeats: beats(atX: max(0, x)))
+    }
+
+    /// Nudge playhead to bar boundaries (touch scrub controls).
+    /// Uses epsilon-tolerant bar indexing so seconds↔beats float error cannot wedge forward.
+    func nudgePlayhead(byBars bars: Int) {
+        guard bars != 0 else { return }
+        let bpb = beatsPerBar
+        guard bpb > 0 else { return }
+
+        let currentBeats = project.secondsToBeats(playheadSeconds)
+        // 11.999999 must count as bar index 3, not 2.
+        let barIndex = Int(floor(currentBeats / bpb + 1e-6))
+        let barStart = Double(barIndex) * bpb
+        let onBarLine = abs(currentBeats - barStart) < 1e-3
+
+        let targetIndex: Int
+        if bars > 0 {
+            targetIndex = barIndex + bars
+        } else if onBarLine {
+            targetIndex = barIndex + bars
+        } else {
+            // Mid-bar: -1 lands on this bar's downbeat; further steps go earlier.
+            targetIndex = barIndex + bars + 1
+        }
+
+        let targetBeats = max(0, Double(targetIndex) * bpb)
+        // Always free of the loop — bottom chevrons are disabled while recording.
+        audio.scrub(to: project.beatsToSeconds(targetBeats))
+        timelineInteraction.requestScrollPlayheadIntoView()
     }
 
     // MARK: - Import
@@ -313,14 +387,20 @@ final class ProjectViewModel: ObservableObject {
         // Don't yank the scrubbed playhead back to the loop start.
         audio.setActiveRegion(project.currentRegion, resetPlayhead: false)
         audio.setArrangementEndSeconds(RecordingManager.arrangementEndSeconds(for: project))
-        if let relative = project.instrumentalTrack?.audioRelativePath,
-           !relative.isEmpty {
-            let url = storage.absoluteURL(for: relative, projectID: project.id)
-            if FileManager.default.fileExists(atPath: url.path) {
-                try? audio.loadInstrumental(url: url)
-            } else {
+        if let resolved = storage.resolveInstrumentalURL(project: project) {
+            repairInstrumentalPathsIfNeeded(relativePath: resolved.relativePath)
+            do {
+                try audio.loadInstrumental(url: resolved.url)
+            } catch {
                 audio.clearInstrumental()
+                recording.statusMessage = "Instrumental failed to load"
+                print("LoopFlow: loadInstrumental failed: \(error)")
             }
+        } else if project.instrumentalTrack?.audioRelativePath != nil
+                    || project.instrumentalTrack?.clips.first?.sourceRelativePath != nil
+                    || !(project.instrumentalTrack?.waveformPeaks.isEmpty ?? true) {
+            audio.clearInstrumental()
+            recording.statusMessage = "Instrumental file missing — re-import"
         } else {
             audio.clearInstrumental()
         }
@@ -334,11 +414,30 @@ final class ProjectViewModel: ObservableObject {
         applyInputMonitor()
     }
 
+    /// Persist a recovered instrumental relative path onto the track and its clip.
+    private func repairInstrumentalPathsIfNeeded(relativePath: String) {
+        guard let trackIdx = project.tracks.firstIndex(where: { $0.type == .instrumental }) else { return }
+        var didRepair = false
+        if project.tracks[trackIdx].audioRelativePath != relativePath {
+            project.tracks[trackIdx].audioRelativePath = relativePath
+            didRepair = true
+        }
+        if let clipIdx = project.tracks[trackIdx].clips.indices.first,
+           project.tracks[trackIdx].clips[clipIdx].sourceRelativePath != relativePath {
+            project.tracks[trackIdx].clips[clipIdx].sourceRelativePath = relativePath
+            didRepair = true
+        }
+        if didRepair {
+            autosave()
+        }
+    }
+
     /// Schedules unmuted vocal/audio clips for live playback.
     func refreshClipPlaybackSchedule() {
         let recordingTrackId: UUID? = {
-            // Count-in + loop record: never play back the track being recorded over.
-            guard recording.phase == .countIn || recording.phase == .loopRecording || audio.isRecording,
+            // Count-in + armed loop record: never play back the track being recorded over.
+            // Lead-in keeps the previous take audible until punch-in.
+            guard recording.phase == .countIn || recording.phase == .loopRecording,
                   let idx = project.recordingTrackIndex else { return nil }
             return project.tracks[idx].id
         }()
@@ -367,9 +466,7 @@ final class ProjectViewModel: ObservableObject {
 
     /// Updates playback mapping for the instrumental clip without resetting the playhead.
     func refreshInstrumentalMapping() {
-        guard let inst = project.instrumentalTrack,
-              let clip = inst.clips.first,
-              !clip.isMuted else {
+        guard let clip = activeInstrumentalClip else {
             audio.clearInstrumentalClipMapping()
             return
         }
@@ -382,19 +479,30 @@ final class ProjectViewModel: ObservableObject {
 
     // MARK: - Instrumental align
 
-    var instrumentalClip: AudioClip? {
-        project.instrumentalTrack?.clips.first
+    /// Prefer the selected instrumental clip, else the earliest unmuted one on the timeline.
+    var instrumentalClip: AudioClip? { activeInstrumentalClip }
+
+    private var activeInstrumentalClip: AudioClip? {
+        guard let inst = project.instrumentalTrack else { return nil }
+        let unmuted = inst.clips.filter { !$0.isMuted }
+        guard !unmuted.isEmpty else { return nil }
+        if let selectedId = timelineInteraction.selectedClipId,
+           let selected = unmuted.first(where: { $0.id == selectedId }) {
+            return selected
+        }
+        return unmuted.min(by: { $0.timelineStartBeats < $1.timelineStartBeats })
     }
 
     /// Skip leading silence so audible content starts at the clip's timeline position (usually bar 1).
     func alignInstrumentalToFirstSound() {
         guard let trackIdx = project.tracks.firstIndex(where: { $0.type == .instrumental }),
-              let relative = project.tracks[trackIdx].audioRelativePath,
-              let clipIdx = project.tracks[trackIdx].clips.indices.first else {
+              let clipIdx = project.tracks[trackIdx].clips.indices.first,
+              let resolved = storage.resolveInstrumentalURL(project: project) else {
             recording.statusMessage = "No instrumental"
             return
         }
-        let url = storage.absoluteURL(for: relative, projectID: project.id)
+        repairInstrumentalPathsIfNeeded(relativePath: resolved.relativePath)
+        let url = resolved.url
         guard let firstSound = TimelineManager.findFirstSoundTime(url: url) else {
             recording.statusMessage = "No sound found"
             return
@@ -422,10 +530,11 @@ final class ProjectViewModel: ObservableObject {
     /// Restore instrumental clip to the full file starting at bar 1.
     func resetInstrumentalClipBounds() {
         guard let trackIdx = project.tracks.firstIndex(where: { $0.type == .instrumental }),
-              let relative = project.tracks[trackIdx].audioRelativePath else {
+              let resolved = storage.resolveInstrumentalURL(project: project) else {
             recording.statusMessage = "No instrumental"
             return
         }
+        repairInstrumentalPathsIfNeeded(relativePath: resolved.relativePath)
         pushUndo()
         let duration = project.instrumentalDurationSeconds
         let peaks = project.tracks[trackIdx].waveformPeaks
@@ -433,7 +542,7 @@ final class ProjectViewModel: ObservableObject {
             project.tracks[trackIdx].clips = [
                 AudioClip(
                     trackId: project.tracks[trackIdx].id,
-                    sourceRelativePath: relative,
+                    sourceRelativePath: resolved.relativePath,
                     sourceStartSeconds: 0,
                     sourceEndSeconds: duration,
                     timelineStartBeats: 0,
@@ -442,6 +551,7 @@ final class ProjectViewModel: ObservableObject {
             ]
         } else {
             var clip = project.tracks[trackIdx].clips[0]
+            clip.sourceRelativePath = resolved.relativePath
             clip.sourceStartSeconds = 0
             clip.sourceEndSeconds = duration
             clip.timelineStartBeats = 0
@@ -651,27 +761,110 @@ final class ProjectViewModel: ObservableObject {
         showImporter = true
     }
 
-    /// Start a fresh project (stops transport, clears engine, opens setup).
+    /// Start a fresh session (stops transport, clears engine, opens setup).
     func startNewProject() {
         recording.stop()
         audio.stop()
         audio.clearInstrumental()
         audio.setClipSchedule([])
         selectClip(nil)
+        clipboard = nil
         let fresh = LoopFlowProject()
         do {
             try storage.ensureProjectFolders(for: fresh.id)
             try storage.save(fresh)
             project = fresh
-            recording.configure(projectID: project.id)
-            recording.syncSelection(from: project)
-            editHistory.clear()
-            applyAudioFromProject()
-            recording.statusMessage = "New project"
+            activateLoadedProject()
+            recording.statusMessage = "New session"
+            isInStudio = true
             showSetupSheet = true
+            refreshSessionSummaries()
         } catch {
             recording.statusMessage = error.localizedDescription
         }
+    }
+
+    func openProject(id: UUID) {
+        recording.stop()
+        audio.stop()
+        audio.clearInstrumental()
+        audio.setClipSchedule([])
+        selectClip(nil)
+        clipboard = nil
+        do {
+            var loaded = try storage.load(projectID: id)
+            loaded.ensureClipsMigrated()
+            loaded.ensureSelectedTrack()
+            project = loaded
+            activateLoadedProject()
+            try storage.save(project)
+            recording.statusMessage = "Opened"
+            isInStudio = true
+            showSetupSheet = project.instrumentalTrack?.audioRelativePath == nil
+            refreshSessionSummaries()
+        } catch {
+            recording.statusMessage = error.localizedDescription
+        }
+    }
+
+    func closeToLibrary() {
+        save()
+        recording.stop()
+        audio.stop()
+        showSetupSheet = false
+        showSettings = false
+        showExport = false
+        isInStudio = false
+        refreshSessionSummaries()
+    }
+
+    func deleteProject(id: UUID) {
+        let deletingCurrent = project.id == id
+        if deletingCurrent {
+            recording.stop()
+            audio.stop()
+            audio.clearInstrumental()
+            audio.setClipSchedule([])
+            selectClip(nil)
+            clipboard = nil
+            isInStudio = false
+            showSetupSheet = false
+        }
+        do {
+            try storage.delete(projectID: id)
+            if deletingCurrent {
+                if let next = storage.listProjectSummaries().first {
+                    var loaded = try storage.load(projectID: next.id)
+                    loaded.ensureClipsMigrated()
+                    loaded.ensureSelectedTrack()
+                    project = loaded
+                    activateLoadedProject()
+                } else {
+                    project = LoopFlowProject()
+                    editHistory.clear()
+                    audio.clearInstrumental()
+                    audio.setClipSchedule([])
+                }
+            }
+            refreshSessionSummaries()
+        } catch {
+            recording.statusMessage = error.localizedDescription
+        }
+    }
+
+    func refreshSessionSummaries() {
+        sessionSummaries = storage.listProjectSummaries()
+    }
+
+    private func activateLoadedProject() {
+        project.ensureClipsMigrated()
+        project.ensureSelectedTrack()
+        recording.configure(projectID: project.id)
+        recording.syncSelection(from: project)
+        controller.updateMappings(project.keyMappings)
+        editHistory.clear()
+        applyAudioFromProject()
+        applyInputMonitor()
     }
 
     // MARK: - Bar selection
@@ -1011,13 +1204,33 @@ final class ProjectViewModel: ObservableObject {
               let found = clip(id: id) else { return }
         pushUndo()
         let path = found.clip.sourceRelativePath
-        project.tracks[found.trackIndex].takes.removeAll { $0.relativePath == path }
-        project.tracks[found.trackIndex].removeClip(id: id)
+        let trackIdx = found.trackIndex
+        let trackType = project.tracks[trackIdx].type
+        project.tracks[trackIdx].takes.removeAll { $0.relativePath == path }
+        project.tracks[trackIdx].removeClip(id: id)
         selectClip(nil)
-        // Drop open file readers before removing the WAV so re-record can arm cleanly.
+
+        // Split shares one file across halves — only delete media when nothing references it.
+        let stillReferenced = project.tracks.contains { track in
+            track.clips.contains { $0.sourceRelativePath == path }
+        }
         refreshClipPlaybackSchedule()
-        let url = storage.absoluteURL(for: path, projectID: project.id)
-        try? FileManager.default.removeItem(at: url)
+        if !stillReferenced {
+            let url = storage.absoluteURL(for: path, projectID: project.id)
+            try? FileManager.default.removeItem(at: url)
+        }
+
+        if trackType == .instrumental {
+            if project.tracks[trackIdx].clips.isEmpty {
+                project.tracks[trackIdx].audioRelativePath = nil
+                project.tracks[trackIdx].waveformPeaks = []
+                project.instrumentalDurationSeconds = 0
+                audio.clearInstrumental()
+            } else {
+                refreshInstrumentalMapping()
+            }
+        }
+
         recording.statusMessage = "Deleted"
         autosave()
     }
@@ -1087,6 +1300,14 @@ final class ProjectViewModel: ObservableObject {
     // MARK: - Timeline helpers
 
     var playheadSeconds: Double { audio.playheadSeconds }
+
+    /// Arrange timeline length in bars — grows with the playhead so scrubbing past short content isn't clipped.
+    var visibleTimelineBars: Int {
+        let bpb = max(beatsPerBar, 1)
+        let playheadBar = Int(floor(project.secondsToBeats(playheadSeconds) / bpb)) + 1
+        let pad = 8
+        return max(project.totalBars, playheadBar + pad, project.selectionEndBar + pad, 16)
+    }
 
     var timeDisplay: String {
         TimelineManager.timeString(seconds: playheadSeconds)

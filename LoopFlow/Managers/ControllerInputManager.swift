@@ -22,7 +22,15 @@ final class ControllerInputManager: ObservableObject {
     }
 
     func updateMappings(_ mappings: [KeyMapping]) {
-        self.mappings = mappings
+        var merged = mappings
+        for action in ControllerAction.allCases {
+            if !merged.contains(where: { $0.action == action }) {
+                merged.append(KeyMapping(action: action, keyCode: nil, keyLabel: nil))
+            }
+        }
+        // Keep defaults order for stable Settings UI.
+        let order = Dictionary(uniqueKeysWithValues: ControllerAction.allCases.enumerated().map { ($1, $0) })
+        self.mappings = merged.sorted { (order[$0.action] ?? 0) < (order[$1.action] ?? 0) }
     }
 
     func startListening() {

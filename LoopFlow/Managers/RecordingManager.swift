@@ -4,6 +4,7 @@ import AVFoundation
 enum RecordingPhase: Equatable {
     case idle
     case countIn
+    case leadIn
     case loopRecording
 }
 
@@ -58,21 +59,7 @@ final class RecordingManager: ObservableObject {
             $0.timelineStartBeats >= startBeats - 0.001 && $0.timelineStartBeats < endBeats - 0.001
         }
 
-        audio.updateTransportContext(
-            bpm: project.bpm,
-            timeSignature: project.timeSignature,
-            loopEnabled: project.loopEnabled,
-            metronomeEnabled: project.metronomeEnabled
-        )
-        audio.setActiveRegion(region)
-        audio.setMasterVolume(project.masterVolume)
-        if let inst = project.instrumentalTrack {
-            audio.setInstrumentalVolume(inst.isMuted ? 0 : inst.volume)
-        }
-
-        audio.setLoopBoundaryHandler { [weak self] in
-            self?.handleLoopBoundary()
-        }
+        prepareTransport(for: project, region: region)
 
         // Count-in only when starting from stop; mid-playback takeovers jump straight to region start.
         let beats = (project.countInEnabled && !audio.isPlaying)
@@ -92,31 +79,167 @@ final class RecordingManager: ObservableObject {
         }
     }
 
-    private func beginLoopRecording(project: LoopFlowProject, replacingKept: Bool = false) {
-        phase = .loopRecording
-        // Exclude the record-track take before play() schedules clip players.
+    /// Play a full loop-length of audio into the selection, then punch-record from region start.
+    /// Falls back to `startRecording` when there is not enough timeline before the selection.
+    func startLeadInRecording(project: LoopFlowProject) {
+        guard phase == .idle else { return }
+        guard let trackIdx = project.recordingTrackIndex else {
+            statusMessage = "Select a vocal/audio track to record"
+            return
+        }
+        let region = project.currentRegion
+        let regionStart = region.startSeconds(bpm: project.bpm, timeSignature: project.timeSignature)
+        let regionDuration = region.durationSeconds(bpm: project.bpm, timeSignature: project.timeSignature)
+        let leadInStart = regionStart - regionDuration
+        guard leadInStart >= -0.001, regionDuration > 0.001 else {
+            startRecording(project: project)
+            return
+        }
+
+        regionIndex = region.startBar
+        let startBeats = project.barToBeats(project.selectionStartBar)
+        let endBeats = project.barToBeats(project.selectionEndBar)
+        let hasKeptClip = project.tracks[trackIdx].clips.contains {
+            $0.timelineStartBeats >= startBeats - 0.001 && $0.timelineStartBeats < endBeats - 0.001
+        }
+
+        prepareTransport(for: project, region: region)
+        // Place playhead before opening the mic file so seek does not arm writes.
+        audio.seekPlayhead(to: max(0, leadInStart), clampToLoop: false)
+
+        phase = .leadIn
+        do {
+            try audio.prepareForRecording()
+        } catch {
+            phase = .idle
+            audio.setLoopBoundaryHandler(nil)
+            statusMessage = error.localizedDescription
+            return
+        }
+        // Hear previous kept take during pre-roll (record track stays scheduled).
         onClipScheduleRefresh?()
         currentTakeNumber = nextTakeNumber(in: project)
         guard openNewTakeFile(), audio.isRecording else {
+            phase = .idle
+            audio.releaseCaptureHold()
+            audio.setLoopBoundaryHandler(nil)
+            statusMessage = "Could not start recording"
+            return
+        }
+
+        audio.setRecordingPunchInHandler { [weak self] in
+            self?.punchIntoLoopRecording(replacingKept: hasKeptClip)
+        }
+
+        do {
+            try audio.play(fromRegionStart: false, armRecordingOnStart: false)
+            statusMessage = "Lead-in…"
+        } catch {
+            statusMessage = error.localizedDescription
+            discardLeadInTake()
+            audio.setRecordingPunchInHandler(nil)
+            audio.setLoopBoundaryHandler(nil)
+            audio.stop()
+            phase = .idle
+        }
+    }
+
+    private func prepareTransport(for project: LoopFlowProject, region: RecordingRegion) {
+        audio.updateTransportContext(
+            bpm: project.bpm,
+            timeSignature: project.timeSignature,
+            loopEnabled: project.loopEnabled,
+            metronomeEnabled: project.metronomeEnabled
+        )
+        audio.setActiveRegion(region)
+        audio.setMasterVolume(project.masterVolume)
+        if let inst = project.instrumentalTrack {
+            audio.setInstrumentalVolume(inst.isMuted ? 0 : inst.volume)
+        }
+        audio.setLoopBoundaryHandler { [weak self] in
+            self?.handleLoopBoundary()
+        }
+    }
+
+    private func beginLoopRecording(project: LoopFlowProject, replacingKept: Bool = false) {
+        phase = .loopRecording
+        currentTakeNumber = nextTakeNumber(in: project)
+
+        // 0) Lock capture session BEFORE play(). Idle play() used to flip
+        //    .measurement→.default then beginRecording flipped back — that IO thrash
+        //    is the distorted monitor/WAV on Keep→Record.
+        do {
+            try audio.prepareForRecording()
+        } catch {
+            statusMessage = error.localizedDescription
+            phase = .idle
+            return
+        }
+
+        // 1) Exclude kept take (soft-mute when mic path already live).
+        onClipScheduleRefresh?()
+
+        // 2) Start or lightly restart transport before enabling monitor writes.
+        do {
+            if audio.isPlaying {
+                audio.jumpToRegionStartPreservingPlayback(armRecordingOnStart: false)
+            } else {
+                try audio.play(fromRegionStart: true, armRecordingOnStart: false)
+            }
+        } catch {
+            statusMessage = error.localizedDescription
+            phase = .idle
+            audio.releaseCaptureHold()
+            return
+        }
+
+        // 3) Open mic file + enable monitor after players are running.
+        guard openNewTakeFile(), audio.isRecording else {
+            audio.stop()
             phase = .idle
             if statusMessage.isEmpty || statusMessage.hasPrefix("Recording") {
                 statusMessage = "Could not start recording"
             }
             return
         }
-        do {
-            try audio.play(fromRegionStart: true)
-            statusMessage = replacingKept
-                ? "Recording take \(currentTakeNumber) — Keep replaces kept clip (Undo restores)"
-                : "Recording take \(currentTakeNumber)"
-        } catch {
-            statusMessage = error.localizedDescription
-            audio.stopRecordingTap()
-            phase = .idle
+        audio.armRecordingWritesAlignedToClock()
+        statusMessage = replacingKept
+            ? "Recording take \(currentTakeNumber) — Keep replaces kept clip (Undo restores)"
+            : "Recording take \(currentTakeNumber)"
+    }
+
+    private func punchIntoLoopRecording(replacingKept: Bool) {
+        guard phase == .leadIn else { return }
+        phase = .loopRecording
+        onClipScheduleRefresh?()
+        statusMessage = replacingKept
+            ? "Recording take \(currentTakeNumber) — Keep replaces kept clip (Undo restores)"
+            : "Recording take \(currentTakeNumber)"
+    }
+
+    private func discardLeadInTake() {
+        guard let take = activeTake else {
+            audio.closeCurrentRecordingFile()
+            return
+        }
+        activeTake = nil
+        audio.closeCurrentRecordingFile()
+        if let url = try? storage.takeFileURL(projectID: projectID, relativePath: take.relativePath) {
+            try? FileManager.default.removeItem(at: url)
         }
     }
 
     func stop() {
+        audio.setRecordingPunchInHandler(nil)
+        if phase == .leadIn {
+            discardLeadInTake()
+            audio.stop()
+            audio.setLoopBoundaryHandler(nil)
+            phase = .idle
+            statusMessage = "Stopped"
+            return
+        }
+
         let pendingTakeNumber = activeTake?.takeNumber
         if let take = finalizeActiveTake() {
             onTakeCompleted?(take)
@@ -363,9 +486,10 @@ final class RecordingManager: ObservableObject {
         let latency = max(0, baseLatency + audio.recordingLatencyOffsetSeconds)
         var sourceStart = min(latency, max(0, duration - 0.05))
 
-        // If the take has a clear onset in the lead-in window, never under-trim past it.
-        // Catches under-reported I/O latency when the performer hits near the 1.
-        if let takeURL,
+        // Onset scan is heavy — never block the main thread while the mic monitor is live.
+        let stillArmed = phase == .loopRecording
+        if !stillArmed,
+           let takeURL,
            let onset = TimelineManager.findFirstSoundTime(
             url: takeURL,
             maxScanSeconds: min(0.35, max(0.05, duration))
@@ -459,27 +583,36 @@ final class RecordingManager: ObservableObject {
             return
         }
         regionIndex = project.selectionStartBar
-        audio.setActiveRegion(project.currentRegion)
+        audio.setActiveRegion(project.currentRegion, resetPlayhead: true)
         statusMessage = "Bars \(project.selectionStartBar)–\(project.selectionEndBar - 1)"
         onAdvanceRegion?()
 
         if continueRecording, phase == .loopRecording {
             currentTakeNumber = nextTakeNumber(in: project)
-            openNewTakeFile()
-            audio.restartPlaybackFromPlayhead()
+            guard openNewTakeFile() else {
+                statusMessage = "Could not continue recording"
+                return
+            }
+            audio.continueRecordingAtRegionStart()
+            statusMessage = "Recording take \(currentTakeNumber)"
         }
     }
 
     func previousRegion(project: inout LoopFlowProject) {
         project.retreatSelection()
         regionIndex = project.selectionStartBar
-        audio.setActiveRegion(project.currentRegion)
+        audio.setActiveRegion(project.currentRegion, resetPlayhead: true)
         if phase == .loopRecording {
             currentTakeNumber = nextTakeNumber(in: project)
-            openNewTakeFile()
-            audio.restartPlaybackFromPlayhead()
+            if openNewTakeFile() {
+                audio.continueRecordingAtRegionStart()
+                statusMessage = "Recording take \(currentTakeNumber)"
+            } else {
+                statusMessage = "Could not continue recording"
+            }
+        } else {
+            statusMessage = "Bars \(project.selectionStartBar)–\(project.selectionEndBar - 1)"
         }
-        statusMessage = "Bars \(project.selectionStartBar)–\(project.selectionEndBar - 1)"
     }
 
     func nextRegion(project: inout LoopFlowProject) {

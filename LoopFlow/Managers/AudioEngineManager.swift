@@ -50,6 +50,8 @@ final class AudioEngineManager: ObservableObject {
     private var instrumentalLoadedURL: URL?
     private var scheduledClips: [ScheduledClip] = []
     private var clipFileCache: [URL: AVAudioFile] = [:]
+    /// Which file each clip player is currently serving (for soft mute without graph rebuild).
+    private var clipPlayerSourceURLs: [URL?] = Array(repeating: nil, count: 8)
     /// Non-destructive instrumental window mapped onto the timeline.
     private var instrumentalSourceStartSeconds: Double = 0
     private var instrumentalSourceEndSeconds: Double = 0
@@ -71,6 +73,10 @@ final class AudioEngineManager: ObservableObject {
     private nonisolated(unsafe) var recordingWriteFormat: AVAudioFormat?
     /// Gate so close/rotate can finalize the WAV before the tap writes again.
     private nonisolated(unsafe) var recordingWriteEnabled = false
+    /// Latest mic peak from the audio-thread tap (published on the display link).
+    private nonisolated(unsafe) var tapPeakLevel: Float = 0
+    /// Deferred tap write error (published on the display link — never hop MainActor from the tap).
+    private nonisolated(unsafe) var pendingTapError: String?
     private var inputTapInstalled = false
     /// Sample rate of the current `inputNode → micSplitter` connection (0 = not connected).
     private var micPathSampleRate: Double = 0
@@ -78,9 +84,15 @@ final class AudioEngineManager: ObservableObject {
     private var configuredSessionMode: AVAudioSession.Mode?
     private var configuredIOBufferDuration: TimeInterval = -1
     private var configuredForCapture = false
+    /// Keep `.measurement` / capture IO across play→arm so Keep→Record doesn’t thrash the mic graph.
+    private var holdCaptureSession = false
+    /// Hardware format used when the mic tap was installed (rotate must match this).
+    private var micTapFormat: AVAudioFormat?
     private var lastRouteReconnectTime: CFAbsoluteTime = 0
     private var onLoopBoundary: (() -> Void)?
     private var onCountInFinished: (() -> Void)?
+    /// One-shot: fires when mic writes arm at region start after a lead-in pre-roll.
+    private var onRecordingPunchIn: (() -> Void)?
 
     private var bpm: Double = 120
     private var timeSignature = TimeSignature.fourFour
@@ -91,6 +103,8 @@ final class AudioEngineManager: ObservableObject {
     private var lastMetronomeBeat: Int = -1
     /// When true, the next host-time crossing of region end may fire a loop boundary.
     private var loopBoundaryArmed = false
+    /// User scrubbed while playing — don't wrap/stop at the loop end until the next play/stop.
+    private var suppressLoopWrapUntilStop = false
 
     /// Round-trip I/O latency for aligning recorded takes to what was heard.
     /// Prefer engine presentation latencies (session figures often under-report through AVAudioEngine).
@@ -245,7 +259,8 @@ final class AudioEngineManager: ObservableObject {
 
     func configureSession(forMonitoring: Bool = false) throws {
         let session = AVAudioSession.sharedInstance()
-        let activeCapture = forMonitoring || desiredMonitorEnabled || isRecording || wantsInputMetering
+        let activeCapture = forMonitoring || desiredMonitorEnabled || isRecording
+            || wantsInputMetering || holdCaptureSession
         let route = session.currentRoute
         let bluetooth = Self.routeIsBluetooth(route)
         // Wired: measurement (low latency, no AEC). Bluetooth: voiceChat for HFP headset mic.
@@ -255,7 +270,8 @@ final class AudioEngineManager: ObservableObject {
         } else {
             mode = .default
         }
-        let buffer = activeCapture ? 0.005 : 0.01
+        // Slightly larger capture buffer — 5ms underruns show up as monitor/WAV static.
+        let buffer = activeCapture ? 0.01 : 0.01
         let options: AVAudioSession.CategoryOptions = [
             .defaultToSpeaker, .allowBluetoothHFP, .allowBluetoothA2DP, .mixWithOthers
         ]
@@ -274,14 +290,45 @@ final class AudioEngineManager: ObservableObject {
             configuredSessionMode = mode
             configuredIOBufferDuration = buffer
             configuredForCapture = activeCapture
+            // Category/mode changes rebuild IO — cached mic graph is stale.
+            micPathSampleRate = 0
+            micTapFormat = nil
         }
 
         sampleRate = session.sampleRate
         refreshRouteState()
     }
 
+    /// Arm capture IO before transport starts so `play()` cannot drop `.measurement`→`.default`.
+    /// Call at the start of every record arm (before schedule refresh / play).
+    func prepareForRecording() throws {
+        holdCaptureSession = true
+        try configureSession(forMonitoring: true)
+        prepareInputCapture()
+        if !engine.isRunning {
+            engine.prepare()
+            try engine.start()
+        }
+        reconnectMetronomeWithHardwareFormat()
+        _ = connectMicPathIfNeeded()
+        // Install tap early (writes still gated) so beginRecording can reuse the path.
+        syncInputTap()
+    }
+
+    func releaseCaptureHold() {
+        guard holdCaptureSession else { return }
+        holdCaptureSession = false
+        syncInputTap()
+        // Drop back to playback session only when mic path is fully idle.
+        if !desiredMonitorEnabled && !wantsInputMetering && !isRecording && recordingFile == nil {
+            try? configureSession(forMonitoring: false)
+        }
+    }
+
     func startEngineIfNeeded() throws {
-        try configureSession(forMonitoring: desiredMonitorEnabled || wantsInputMetering || isRecording)
+        try configureSession(
+            forMonitoring: desiredMonitorEnabled || wantsInputMetering || isRecording || holdCaptureSession
+        )
         prepareInputCapture()
         if !engine.isRunning {
             engine.prepare()
@@ -300,7 +347,9 @@ final class AudioEngineManager: ObservableObject {
     private func ensureEngineRunning() -> Bool {
         if engine.isRunning { return true }
         do {
-            try configureSession(forMonitoring: desiredMonitorEnabled || wantsInputMetering || isRecording)
+            try configureSession(
+                forMonitoring: desiredMonitorEnabled || wantsInputMetering || isRecording || holdCaptureSession
+            )
             prepareInputCapture()
             engine.prepare()
             try engine.start()
@@ -382,10 +431,11 @@ final class AudioEngineManager: ObservableObject {
             }
             _ = connectMicPathIfNeeded()
             syncInputTap()
+            // Prefer track Input Monitor volume; when I is off, a moderate floor (not 0.85).
             let volume = recordingMonitor
-                ? max(desiredMonitorVolume, 0.85)
+                ? (desiredMonitorVolume > 0.001 ? desiredMonitorVolume : 0.55)
                 : desiredMonitorVolume
-            vocalMonitorMixer.outputVolume = max(0.05, volume)
+            vocalMonitorMixer.outputVolume = recordingMonitor ? max(0.05, volume) : volume
             _ = ensureEngineRunning()
         } else {
             vocalMonitorMixer.outputVolume = 0
@@ -498,7 +548,24 @@ final class AudioEngineManager: ObservableObject {
         if next == scheduledClips {
             return
         }
+
+        let previous = scheduledClips
+        let removed = previous.filter { !next.contains($0) }
+
         scheduledClips = next
+
+        // Soft-mute whenever the mic path is live — not only after isRecording flips.
+        // Never rebuild clip players under a live monitor (static lands in the record tap too).
+        let micLive = isRecording || desiredMonitorEnabled || wantsInputMetering || recordingFile != nil
+            || vocalMonitorMixer.outputVolume > 0.001
+        if micLive {
+            if !removed.isEmpty {
+                silenceScheduledClips(removed)
+            }
+            // Defer adds until the next idle refresh — record-track exclude is removals-only.
+            return
+        }
+
         // Drop cached readers so re-recorded files reopen fresh.
         clipFileCache.removeAll()
         let transportActive = isPlaying || isRecording
@@ -508,6 +575,21 @@ final class AudioEngineManager: ObservableObject {
                 let count = scheduleClips(at: playheadSeconds)
                 startClipPlayers(count: count)
             }
+        }
+    }
+
+    /// Mute/stop players serving removed clips without tearing down the rest of the graph.
+    private func silenceScheduledClips(_ removed: [ScheduledClip]) {
+        let removedPaths = Set(removed.map { $0.url.standardizedFileURL.path })
+        for i in clipPlayers.indices {
+            guard let url = clipPlayerSourceURLs[i],
+                  removedPaths.contains(url.standardizedFileURL.path) else { continue }
+            clipPlayers[i].volume = 0
+            clipPlayers[i].stop()
+            clipPlayerSourceURLs[i] = nil
+        }
+        for clip in removed {
+            clipFileCache.removeValue(forKey: clip.url)
         }
     }
 
@@ -521,6 +603,7 @@ final class AudioEngineManager: ObservableObject {
         instrumentalSourceEndSeconds = max(instrumentalSourceStartSeconds + 0.05, sourceEndSeconds)
         instrumentalTimelineStartSeconds = max(0, timelineStartSeconds)
         instrumentalClipMappingEnabled = true
+        rescheduleInstrumentalIfTransportActive()
     }
 
     func clearInstrumentalClipMapping() {
@@ -528,6 +611,16 @@ final class AudioEngineManager: ObservableObject {
         instrumentalSourceStartSeconds = 0
         instrumentalSourceEndSeconds = 0
         instrumentalTimelineStartSeconds = 0
+    }
+
+    /// Keep the bed in sync when mapping changes mid-transport (mirrors clip schedule refresh).
+    private func rescheduleInstrumentalIfTransportActive() {
+        let transportActive = isPlaying || isRecording
+        guard transportActive, !isCountingIn else { return }
+        instrumentalPlayer.stop()
+        guard ensureEngineRunning() else { return }
+        scheduleInstrumentalSegment(at: playheadSeconds)
+        instrumentalPlayer.play()
     }
 
     func updateTransportContext(
@@ -562,7 +655,7 @@ final class AudioEngineManager: ObservableObject {
         if isRecording {
             return regionEnd
         }
-        if loopEnabled, playheadSeconds < regionEnd - 0.001 {
+        if loopEnabled, !suppressLoopWrapUntilStop, playheadSeconds < regionEnd - 0.001 {
             return regionEnd
         }
         return max(regionEnd, arrangementEndSeconds, playheadSeconds + 0.05)
@@ -610,22 +703,68 @@ final class AudioEngineManager: ObservableObject {
         seekPlayhead(to: playheadSeconds)
     }
 
-    /// Scrub: free playhead always when stopped or playing; clamp only while recording into the loop.
+    /// Keep+Next while armed: jump to the new region start without tearing down clip players
+    /// under a live mic (full seek/rebuild causes monitor static).
+    func continueRecordingAtRegionStart() {
+        jumpToRegionStartPreservingPlayback(armRecordingOnStart: true)
+        applyDesiredMonitor()
+    }
+
+    /// Restart the musical clock at region start without `play()`'s full player teardown.
+    /// Used when re-arming over a kept take while transport is already running.
+    func jumpToRegionStartPreservingPlayback(armRecordingOnStart: Bool = false) {
+        playheadSeconds = regionStartSeconds
+        instrumentalPlayer.stop()
+        guard ensureEngineRunning() else { return }
+        scheduleInstrumentalSegment(at: playheadSeconds)
+        if !instrumentalPlayer.isPlaying {
+            instrumentalPlayer.play()
+        }
+        if metronomeEnabled, !metronomePlayer.isPlaying {
+            metronomePlayer.play()
+        }
+        lastMetronomeBeat = -1
+        loopBoundaryArmed = true
+        suppressLoopWrapUntilStop = false
+        playbackStartedOffset = playheadSeconds
+        playbackStartedHostTime = mach_absolute_time()
+        isPlaying = true
+        if armRecordingOnStart {
+            armRecordingWritesAlignedToClock()
+        }
+        if displayLink == nil {
+            startDisplayLink()
+        }
+    }
+
+    /// Scrub playhead freely (not clamped to the loop). While playing, disables loop wrap for this run.
     func scrub(to seconds: Double) {
-        let clamp = isRecording && loopEnabled
-        seekPlayhead(to: seconds, clampToLoop: clamp)
+        if isPlaying, !isRecording {
+            suppressLoopWrapUntilStop = true
+        }
+        seekPlayhead(to: seconds, clampToLoop: false)
     }
 
     func setLoopBoundaryHandler(_ handler: (() -> Void)?) {
         onLoopBoundary = handler
     }
 
+    func setRecordingPunchInHandler(_ handler: (() -> Void)?) {
+        onRecordingPunchIn = handler
+    }
+
     // MARK: - Playback
 
-    func play(fromRegionStart: Bool = true) throws {
+    func play(fromRegionStart: Bool = true, armRecordingOnStart: Bool = true) throws {
         try startEngineIfNeeded()
+        // Duck monitor while rebuilding players — churn under a live mic → static/distortion.
+        let restoreMonitor = isRecording || desiredMonitorEnabled || wantsInputMetering
+            || vocalMonitorMixer.outputVolume > 0.001
+        vocalMonitorMixer.outputVolume = 0
+
         stopPlayers(keepEngine: true)
         guard ensureEngineRunning() else {
+            if restoreMonitor { applyDesiredMonitor() }
             throw NSError(
                 domain: "LoopFlow",
                 code: 3,
@@ -643,6 +782,7 @@ final class AudioEngineManager: ObservableObject {
         scheduleMetronomeIfNeeded()
 
         guard ensureEngineRunning() else {
+            if restoreMonitor { applyDesiredMonitor() }
             throw NSError(
                 domain: "LoopFlow",
                 code: 3,
@@ -660,29 +800,44 @@ final class AudioEngineManager: ObservableObject {
         isCountingIn = false
         lastMetronomeBeat = -1
         loopBoundaryArmed = true
+        suppressLoopWrapUntilStop = false
         playbackStartedOffset = playheadSeconds
         playbackStartedHostTime = mach_absolute_time()
         // Start mic writes only once the musical clock is running (avoids pre-roll silence).
-        armRecordingWritesAlignedToClock()
-        // Re-assert monitor after startEngineIfNeeded/session churn.
-        if isRecording {
+        if armRecordingOnStart {
+            armRecordingWritesAlignedToClock()
+        }
+        // Re-assert monitor after player churn / session work.
+        if restoreMonitor || isRecording {
             applyDesiredMonitor()
         }
         startDisplayLink()
     }
 
     func stop() {
+        onRecordingPunchIn = nil
         stopRecordingTap()
         stopPlayers(keepEngine: true)
         isPlaying = false
         isRecording = false
         isCountingIn = false
         loopBoundaryArmed = false
-        displayLink?.invalidate()
-        displayLink = nil
+        suppressLoopWrapUntilStop = false
         playbackStartedHostTime = nil
-        if !wantsInputMetering {
+        // Keep the display link for tap metering when Input Monitor / meter is still armed.
+        if wantsInputMetering || desiredMonitorEnabled || inputTapInstalled {
+            if displayLink == nil {
+                startDisplayLink()
+            }
+        } else {
+            displayLink?.invalidate()
+            displayLink = nil
             inputLevel = 0
+            tapPeakLevel = 0
+        }
+        // Release sticky capture only when the mic path is fully idle.
+        if !desiredMonitorEnabled && !wantsInputMetering {
+            releaseCaptureHold()
         }
     }
 
@@ -703,9 +858,10 @@ final class AudioEngineManager: ObservableObject {
     }
 
     private func stopClipPlayers() {
-        for player in clipPlayers {
-            player.stop()
-            player.volume = 1
+        for i in clipPlayers.indices {
+            clipPlayers[i].stop()
+            clipPlayers[i].volume = 1
+            clipPlayerSourceURLs[i] = nil
         }
     }
 
@@ -772,6 +928,7 @@ final class AudioEngineManager: ObservableObject {
             }
 
             player.volume = max(0, min(1, clip.gain))
+            clipPlayerSourceURLs[playerIndex] = clip.url
             player.scheduleSegment(
                 file,
                 startingFrame: startFrame,
@@ -849,7 +1006,9 @@ final class AudioEngineManager: ObservableObject {
         guard loopBoundaryArmed else { return }
         loopBoundaryArmed = false
 
-        if loopEnabled {
+        // While recording, always wrap the take loop — even if arrangement loop UI is off.
+        // Stopping here would leave RecordingManager.phase out of sync with isRecording.
+        if loopEnabled || isRecording {
             playheadSeconds = regionStartSeconds
             onLoopBoundary?()
             instrumentalPlayer.stop()
@@ -866,6 +1025,9 @@ final class AudioEngineManager: ObservableObject {
             playbackStartedOffset = regionStartSeconds
             playbackStartedHostTime = mach_absolute_time()
             armRecordingWritesAlignedToClock()
+            if isRecording {
+                applyDesiredMonitor()
+            }
         } else {
             stop()
         }
@@ -917,7 +1079,31 @@ final class AudioEngineManager: ObservableObject {
     // MARK: - Recording tap + metering
 
     func beginRecording(to url: URL) throws {
-        try startEngineIfNeeded()
+        // Always capture — do not probe the session with isRecording==false (that
+        // flips default↔measurement and leaves a stale mic graph with volume up / silence).
+        try configureSession(forMonitoring: true)
+        prepareInputCapture()
+        if !engine.isRunning {
+            engine.prepare()
+            try engine.start()
+        }
+        reconnectMetronomeWithHardwareFormat()
+
+        // Reuse a healthy mic+tap path. Tearing it down under (or just before) live
+        // monitor is what distorts overdubs over kept takes — and the WAV.
+        let inputFormat = engine.inputNode.inputFormat(forBus: 0)
+        let pathHealthy = inputTapInstalled
+            && micPathSampleRate > 0
+            && inputFormat.sampleRate > 0
+            && abs(micPathSampleRate - inputFormat.sampleRate) < 1
+        if !pathHealthy {
+            if inputTapInstalled {
+                micSplitter.removeTap(onBus: 0)
+                inputTapInstalled = false
+            }
+            micPathSampleRate = 0
+        }
+
         guard let hwFormat = connectMicPathIfNeeded(), hwFormat.sampleRate > 0 else {
             throw NSError(domain: "LoopFlow", code: 1, userInfo: [NSLocalizedDescriptionKey: "Microphone unavailable"])
         }
@@ -940,6 +1126,7 @@ final class AudioEngineManager: ObservableObject {
         recordingFile = try AVAudioFile(forWriting: url, settings: fileFormat.settings)
         recordingFileForTap = recordingFile
         recordingWriteFormat = fileFormat
+        micTapFormat = hwFormat
         if hwFormat != fileFormat {
             recordingConverter = AVAudioConverter(from: hwFormat, to: fileFormat)
         } else {
@@ -947,6 +1134,7 @@ final class AudioEngineManager: ObservableObject {
         }
         recordingWriteEnabled = false
         isRecording = true
+        holdCaptureSession = true
         syncInputTap()
         // Hear yourself while recording when on headphones/BT (even if I is off).
         applyDesiredMonitor()
@@ -958,7 +1146,8 @@ final class AudioEngineManager: ObservableObject {
         recordingFileForTap = nil
         recordingFile = nil
 
-        let hwFormat = engine.inputNode.inputFormat(forBus: 0)
+        // Match the installed tap format — fresh inputNode queries can disagree mid-session.
+        let hwFormat = micTapFormat ?? engine.inputNode.inputFormat(forBus: 0)
         guard let fileFormat = recordingWriteFormat ?? AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
             sampleRate: hwFormat.sampleRate > 0 ? hwFormat.sampleRate : 44_100,
@@ -975,6 +1164,8 @@ final class AudioEngineManager: ObservableObject {
         recordingWriteFormat = fileFormat
         if hwFormat.sampleRate > 0, hwFormat != fileFormat {
             recordingConverter = AVAudioConverter(from: hwFormat, to: fileFormat)
+        } else {
+            recordingConverter = nil
         }
         // Leave writes off until the musical clock restarts (play / seek / loop wrap).
         recordingWriteEnabled = false
@@ -983,8 +1174,16 @@ final class AudioEngineManager: ObservableObject {
     /// Enable mic file writes aligned to the current host clock (and refresh latency stamp).
     func armRecordingWritesAlignedToClock() {
         guard isRecording, recordingFile != nil else { return }
+        // Lead-in: keep writes gated until the playhead reaches the loop region.
+        if onRecordingPunchIn != nil, playheadSeconds < regionStartSeconds - 0.0001 {
+            return
+        }
         activeRecordingLatencySeconds = roundTripLatencySeconds
         recordingWriteEnabled = true
+        if let punch = onRecordingPunchIn {
+            onRecordingPunchIn = nil
+            punch()
+        }
     }
 
     func closeCurrentRecordingFile() {
@@ -1023,12 +1222,13 @@ final class AudioEngineManager: ObservableObject {
     }
 
     private func syncInputTap() {
-        let needTap = isRecording || recordingFile != nil || wantsInputMetering
+        let needTap = isRecording || recordingFile != nil || wantsInputMetering || holdCaptureSession
         if needTap {
             installInputTapIfNeeded()
         } else if inputTapInstalled {
             micSplitter.removeTap(onBus: 0)
             inputTapInstalled = false
+            micTapFormat = nil
         }
     }
 
@@ -1040,9 +1240,10 @@ final class AudioEngineManager: ObservableObject {
         }
 
         // Tap splitter (not inputNode) so hardware passthrough stays audible.
-        micSplitter.installTap(onBus: 0, bufferSize: 256, format: format) { [weak self] buffer, _ in
+        // No MainActor hops from this callback — they glitch monitor + WAV together.
+        micSplitter.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
             guard let self else { return }
-            let peak = Self.bufferPeakLevel(buffer)
+            self.tapPeakLevel = Self.bufferPeakLevel(buffer)
             if self.recordingWriteEnabled {
                 Self.writeRecordingBuffer(
                     buffer,
@@ -1050,17 +1251,26 @@ final class AudioEngineManager: ObservableObject {
                     converter: self.recordingConverter,
                     writeFormat: self.recordingWriteFormat
                 ) { message in
-                    Task { @MainActor in
-                        self.errorMessage = message
-                    }
+                    self.pendingTapError = message
                 }
-            }
-            Task { @MainActor in
-                self.smoothInputLevel(peak)
             }
         }
         inputTapInstalled = true
+        micTapFormat = format
+        if displayLink == nil {
+            startDisplayLink()
+        }
         _ = ensureEngineRunning()
+    }
+
+    /// Publish tap peak / errors on the main-thread display link (never from the audio tap).
+    private func publishTapMetering() {
+        if let message = pendingTapError {
+            pendingTapError = nil
+            errorMessage = message
+        }
+        guard inputTapInstalled || isRecording || wantsInputMetering else { return }
+        smoothInputLevel(tapPeakLevel)
     }
 
     private nonisolated static func writeRecordingBuffer(
@@ -1148,6 +1358,7 @@ final class AudioEngineManager: ObservableObject {
     }
 
     fileprivate func displayTick() {
+        publishTapMetering()
         guard let start = playbackStartedHostTime else { return }
         let elapsed = hostTimeToSeconds(mach_absolute_time() - start)
 
@@ -1173,8 +1384,17 @@ final class AudioEngineManager: ObservableObject {
             let position = playbackStartedOffset + elapsed
             let regionEnd = regionStartSeconds + regionDurationSeconds
 
-            // Loop wrap only when playing through the loop end — not when starting past it.
+            // Punch-in after lead-in: arm mic writes when the playhead enters the loop region.
+            if isRecording, onRecordingPunchIn != nil, !recordingWriteEnabled,
+               position >= regionStartSeconds - 0.0001 {
+                playheadSeconds = max(position, regionStartSeconds)
+                armRecordingWritesAlignedToClock()
+            }
+
+            // Loop wrap only when playing through the loop end — not when starting past it
+            // or after the user scrubbed the playhead during this transport run.
             let shouldWrapLoop = (loopEnabled || isRecording)
+                && !suppressLoopWrapUntilStop
                 && position >= regionEnd
                 && playbackStartedOffset < regionEnd - 0.001
 
@@ -1184,10 +1404,15 @@ final class AudioEngineManager: ObservableObject {
                 playheadSeconds = regionStartSeconds
             } else {
                 playheadSeconds = position
-                let stopAt = isRecording
-                    ? regionEnd
-                    : max(regionEnd, arrangementEndSeconds, playbackStartedOffset + 0.05)
-                if !shouldWrapLoop, position >= stopAt {
+                let stopAt: Double
+                if isRecording {
+                    stopAt = regionEnd
+                } else if suppressLoopWrapUntilStop {
+                    stopAt = max(arrangementEndSeconds, playbackStartedOffset + 0.05)
+                } else {
+                    stopAt = max(regionEnd, arrangementEndSeconds, playbackStartedOffset + 0.05)
+                }
+                if position >= stopAt {
                     stop()
                     return
                 }

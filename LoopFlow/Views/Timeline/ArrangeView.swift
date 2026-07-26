@@ -13,7 +13,7 @@ struct ArrangeView: View {
     }
 
     private var timelineWidth: CGFloat {
-        CGFloat(max(1, vm.project.totalBars)) * vm.pixelsPerBar
+        CGFloat(max(1, vm.visibleTimelineBars)) * vm.pixelsPerBar
     }
 
     var body: some View {
@@ -28,13 +28,23 @@ struct ArrangeView: View {
                         .frame(width: 2)
                         .frame(height: max(contentHeight, geo.size.height))
 
-                    ScrollView(.horizontal, showsIndicators: true) {
-                        TimelineView(vm: vm)
-                            .frame(
-                                width: max(geo.size.width - ArrangeMetrics.headerWidth - 2, timelineWidth),
-                                height: max(contentHeight, geo.size.height),
-                                alignment: .topLeading
-                            )
+                    ScrollViewReader { proxy in
+                        ScrollView(.horizontal, showsIndicators: true) {
+                            TimelineView(vm: vm)
+                                .frame(
+                                    width: max(geo.size.width - ArrangeMetrics.headerWidth - 2, timelineWidth),
+                                    height: max(contentHeight, geo.size.height),
+                                    alignment: .topLeading
+                                )
+                        }
+                        .onChange(of: vm.timelineInteraction.playheadScrollToken) { _, _ in
+                            // Wait a turn so the playhead anchor re-layouts at the new x.
+                            DispatchQueue.main.async {
+                                withAnimation(.easeInOut(duration: 0.15)) {
+                                    proxy.scrollTo(TimelineView.playheadScrollID, anchor: .center)
+                                }
+                            }
+                        }
                     }
                     .simultaneousGesture(pinchZoom)
                     .frame(maxWidth: .infinity)
@@ -87,11 +97,12 @@ struct ArrangeView: View {
             .background(AppTheme.surface)
 
             List {
-                ForEach(Array(vm.project.tracks.indices), id: \.self) { index in
-                    let track = vm.project.tracks[index]
+                ForEach(vm.project.tracks) { track in
                     TrackHeaderView(
                         track: Binding(
-                            get: { vm.project.tracks[index] },
+                            get: {
+                                vm.project.tracks.first(where: { $0.id == track.id }) ?? track
+                            },
                             set: { vm.updateTrack($0) }
                         ),
                         isSelected: vm.project.selectedTrackId == track.id,

@@ -100,9 +100,10 @@ enum TimelineManager {
         guard !peaks.isEmpty, totalDuration > 0 else { return peaks }
         let startRatio = min(1, max(0, sourceStart / totalDuration))
         let endRatio = min(1, max(startRatio + 0.001, sourceEnd / totalDuration))
-        let a = Int(startRatio * Double(peaks.count))
-        let b = max(a + 1, Int(endRatio * Double(peaks.count)))
-        return Array(peaks[a..<min(peaks.count, b)])
+        let a = min(peaks.count - 1, max(0, Int(startRatio * Double(peaks.count))))
+        let b = min(peaks.count, max(a + 1, Int(endRatio * Double(peaks.count))))
+        guard a < b else { return [peaks[a]] }
+        return Array(peaks[a..<b])
     }
 
     /// Downsample audio file into peak magnitudes for waveform drawing.

@@ -11,7 +11,7 @@ struct BarRulerView: View {
     private var loopOn: Bool { vm.project.loopEnabled }
     private var rulerHeight: CGFloat { ArrangeMetrics.rulerHeight(loopEnabled: loopOn) }
     private var loopBandHeight: CGFloat { ArrangeMetrics.loopBandHeight(loopEnabled: loopOn) }
-    private var totalBars: Int { max(1, vm.project.totalBars) }
+    private var totalBars: Int { max(1, vm.visibleTimelineBars) }
     private var width: CGFloat { CGFloat(totalBars) * vm.pixelsPerBar }
 
     var body: some View {

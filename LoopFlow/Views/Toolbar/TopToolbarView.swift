@@ -2,12 +2,21 @@ import SwiftUI
 
 struct TopToolbarView: View {
     @ObservedObject var vm: ProjectViewModel
+    @State private var confirmNewSession = false
 
     var body: some View {
         VStack(spacing: 8) {
             HStack(spacing: 10) {
+                Button {
+                    vm.closeToLibrary()
+                } label: {
+                    Image(systemName: "xmark")
+                }
+                .foregroundStyle(AppTheme.textPrimary)
+                .accessibilityLabel("Close")
+
                 menuButton
-                TextField("Project", text: $vm.project.name)
+                TextField("Session", text: $vm.project.name)
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(AppTheme.textPrimary)
                     .multilineTextAlignment(.center)
@@ -19,7 +28,7 @@ struct TopToolbarView: View {
                 Button {
                     vm.save()
                 } label: {
-                    Label("Save", systemImage: "icloud.and.arrow.up")
+                    Label("Save", systemImage: "square.and.arrow.down")
                         .labelStyle(.iconOnly)
                 }
                 .foregroundStyle(AppTheme.textPrimary)
@@ -48,6 +57,16 @@ struct TopToolbarView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
         .background(AppTheme.surface)
+        .confirmationDialog(
+            "Start a new session? Current work is already saved.",
+            isPresented: $confirmNewSession,
+            titleVisibility: .visible
+        ) {
+            Button("New Session", role: .destructive) {
+                vm.startNewProject()
+            }
+            Button("Cancel", role: .cancel) {}
+        }
     }
 
     private var menuButton: some View {
@@ -57,7 +76,8 @@ struct TopToolbarView: View {
             Button("Project Setup…") { vm.showSetupSheet = true }
             Button("Export…") { vm.showExport = true }
             Divider()
-            Button("New Project", role: .destructive) { vm.startNewProject() }
+            Button("Sessions") { vm.closeToLibrary() }
+            Button("New Session", role: .destructive) { confirmNewSession = true }
             Divider()
             Button("Settings") { vm.showSettings = true }
         } label: {

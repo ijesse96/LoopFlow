@@ -3,11 +3,12 @@ import SwiftUI
 struct SettingsView: View {
     @ObservedObject var vm: ProjectViewModel
     @Environment(\.dismiss) private var dismiss
+    @State private var confirmNewSession = false
 
     var body: some View {
         NavigationStack {
             List {
-                Section("Project") {
+                Section("Session") {
                     Stepper(value: $vm.project.bpm, in: 40...240, step: 1) {
                         Text("BPM: \(Int(vm.project.bpm))")
                     }
@@ -69,9 +70,8 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    Button("New Project", role: .destructive) {
-                        vm.startNewProject()
-                        dismiss()
+                    Button("New Session", role: .destructive) {
+                        confirmNewSession = true
                     }
                 }
 
@@ -97,6 +97,17 @@ struct SettingsView: View {
             }
             .scrollContentBackground(.hidden)
             .background(AppTheme.background)
+            .confirmationDialog(
+                "Start a new session? Current work is already saved.",
+                isPresented: $confirmNewSession,
+                titleVisibility: .visible
+            ) {
+                Button("New Session", role: .destructive) {
+                    dismiss()
+                    vm.startNewProject()
+                }
+                Button("Cancel", role: .cancel) {}
+            }
         }
         .preferredColorScheme(.dark)
     }

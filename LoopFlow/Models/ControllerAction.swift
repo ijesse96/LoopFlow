@@ -8,6 +8,7 @@ enum ControllerAction: String, Codable, CaseIterable, Identifiable {
     case redoRegion
     case undo
     case record
+    case leadIn
     case stop
 
     var id: String { rawValue }
@@ -21,6 +22,7 @@ enum ControllerAction: String, Codable, CaseIterable, Identifiable {
         case .redoRegion: return "Redo Region"
         case .undo: return "Undo"
         case .record: return "Record"
+        case .leadIn: return "Lead In"
         case .stop: return "Stop"
         }
     }

@@ -19,6 +19,7 @@ struct KeyMapping: Codable, Equatable, Identifiable {
             KeyMapping(action: .redoRegion, keyCode: 0x15, keyLabel: "R"),          // R
             KeyMapping(action: .undo, keyCode: 0x1D, keyLabel: "Z"),                // Z
             KeyMapping(action: .record, keyCode: 0x12, keyLabel: "O"),              // O
+            KeyMapping(action: .leadIn, keyCode: nil, keyLabel: nil),
             KeyMapping(action: .stop, keyCode: 0x29, keyLabel: "Esc")               // Escape
         ]
     }

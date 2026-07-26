@@ -6,6 +6,34 @@ struct ContentView: View {
     @FocusState private var keyboardFocused: Bool
 
     var body: some View {
+        Group {
+            if vm.isInStudio {
+                studioContent
+            } else {
+                SessionLibraryView(vm: vm)
+            }
+        }
+        .fileImporter(
+            isPresented: $vm.showImporter,
+            allowedContentTypes: vm.importTypes,
+            allowsMultipleSelection: false
+        ) { result in
+            if case .success(let urls) = result, let url = urls.first {
+                vm.importInstrumental(url: url)
+            }
+        }
+        .sheet(isPresented: $vm.showSettings) {
+            SettingsView(vm: vm)
+        }
+        .sheet(isPresented: $vm.showExport) {
+            ExportView(vm: vm)
+        }
+        .sheet(isPresented: $vm.showSetupSheet) {
+            ProjectSetupView(vm: vm)
+        }
+    }
+
+    private var studioContent: some View {
         NavigationStack {
             ZStack {
                 AppTheme.background.ignoresSafeArea()
@@ -38,24 +66,6 @@ struct ContentView: View {
                 vm.syncMappingsFromController()
             }
             return .handled
-        }
-        .fileImporter(
-            isPresented: $vm.showImporter,
-            allowedContentTypes: vm.importTypes,
-            allowsMultipleSelection: false
-        ) { result in
-            if case .success(let urls) = result, let url = urls.first {
-                vm.importInstrumental(url: url)
-            }
-        }
-        .sheet(isPresented: $vm.showSettings) {
-            SettingsView(vm: vm)
-        }
-        .sheet(isPresented: $vm.showExport) {
-            ExportView(vm: vm)
-        }
-        .sheet(isPresented: $vm.showSetupSheet) {
-            ProjectSetupView(vm: vm)
         }
         .toolbar(.hidden, for: .navigationBar)
     }
@@ -101,35 +111,148 @@ struct ContentView: View {
     }
 
     private var bottomTransportBar: some View {
-        HStack(spacing: 12) {
-            Button {
-                vm.handleControllerAction(.keepTake)
-            } label: {
-                Text("Keep Take")
-                    .font(.subheadline.weight(.semibold))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 12)
-                    .background(AppTheme.accent)
-                    .foregroundStyle(.black)
-                    .clipShape(RoundedRectangle(cornerRadius: 10))
+        let scrubDisabled = vm.recording.phase != .idle
+        return VStack(spacing: 10) {
+            HStack(spacing: 12) {
+                bottomBarButton(
+                    title: vm.recording.phase == .idle ? "Record" : "Stop",
+                    fill: vm.recording.phase == .idle ? AppTheme.record : AppTheme.surfaceElevated,
+                    foreground: vm.recording.phase == .idle ? .white : AppTheme.textPrimary
+                ) {
+                    vm.toggleRecord()
+                }
+                bottomBarButton(title: "Keep + Next", fill: AppTheme.surfaceElevated, foreground: AppTheme.textPrimary) {
+                    vm.handleControllerAction(.keepTakeAndNext)
+                }
             }
-            .buttonStyle(.plain)
-
-            Button {
-                vm.handleControllerAction(.keepTakeAndNext)
-            } label: {
-                Text("Keep + Next")
-                    .font(.subheadline.weight(.semibold))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 12)
-                    .background(AppTheme.surfaceElevated)
-                    .foregroundStyle(AppTheme.textPrimary)
-                    .clipShape(RoundedRectangle(cornerRadius: 10))
+            HStack(spacing: 12) {
+                bottomBarButton(title: "Keep Take", fill: AppTheme.accent, foreground: .black) {
+                    vm.handleControllerAction(.keepTake)
+                }
+                bottomBarButton(
+                    title: "Lead In",
+                    fill: AppTheme.surfaceElevated,
+                    foreground: AppTheme.textPrimary,
+                    disabled: scrubDisabled
+                ) {
+                    vm.handleControllerAction(.leadIn)
+                }
             }
-            .buttonStyle(.plain)
+            HStack(spacing: 12) {
+                HoldRepeatIconButton(
+                    systemName: "chevron.backward",
+                    fill: AppTheme.surfaceElevated,
+                    foreground: AppTheme.textPrimary,
+                    disabled: scrubDisabled
+                ) {
+                    vm.nudgePlayhead(byBars: -1)
+                }
+                bottomBarIconButton(
+                    systemName: vm.audio.isPlaying && vm.recording.phase == .idle ? "pause.fill" : "play.fill",
+                    fill: AppTheme.surfaceElevated,
+                    foreground: AppTheme.transport
+                ) {
+                    vm.togglePlay()
+                }
+                HoldRepeatIconButton(
+                    systemName: "chevron.forward",
+                    fill: AppTheme.surfaceElevated,
+                    foreground: AppTheme.textPrimary,
+                    disabled: scrubDisabled
+                ) {
+                    vm.nudgePlayhead(byBars: 1)
+                }
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
         .background(AppTheme.surface)
+    }
+
+    private func bottomBarButton(
+        title: String,
+        fill: Color,
+        foreground: Color,
+        disabled: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+                .background(fill)
+                .foregroundStyle(foreground)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .opacity(disabled ? 0.45 : 1)
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
+    }
+
+    private func bottomBarIconButton(
+        systemName: String,
+        fill: Color,
+        foreground: Color,
+        disabled: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.title3.weight(.semibold))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+                .background(fill)
+                .foregroundStyle(foreground)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .opacity(disabled ? 0.45 : 1)
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
+    }
+}
+
+/// Icon button: one tap via Button; hold-repeat starts only after a short delay.
+private struct HoldRepeatIconButton: View {
+    let systemName: String
+    let fill: Color
+    let foreground: Color
+    var disabled: Bool = false
+    let action: () -> Void
+
+    @State private var repeatTask: Task<Void, Never>?
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.title3.weight(.semibold))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+                .background(fill)
+                .foregroundStyle(foreground)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .opacity(disabled ? 0.45 : 1)
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { _ in
+                    guard !disabled else { return }
+                    guard repeatTask == nil else { return }
+                    // Delay before repeat so a normal tap is only the Button action.
+                    repeatTask = Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 350_000_000)
+                        while !Task.isCancelled {
+                            action()
+                            try? await Task.sleep(nanoseconds: 180_000_000)
+                        }
+                    }
+                }
+                .onEnded { _ in
+                    repeatTask?.cancel()
+                    repeatTask = nil
+                }
+        )
     }
 }

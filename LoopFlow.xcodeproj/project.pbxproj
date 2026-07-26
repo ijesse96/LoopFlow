@@ -47,6 +47,7 @@
 		FFA36B32D5A54DD896494AC1 /* BarRulerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F39C7CF9966C4211ABBB59D9 /* BarRulerView.swift */; };
 		F2E02CD7D41F4F069AAFDC1B /* AudioClipView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 481B65930AAA40C69F6D203A /* AudioClipView.swift */; };
 		45BC8292F363492ABE73A323 /* RegionEditSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 865AB21BC9B743F8960BCA76 /* RegionEditSheet.swift */; };
+		A7C4E91F2B384D6E9F0A1B2C /* SessionLibraryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B8D5F02A3C495E7F0A1B2C3D /* SessionLibraryView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -92,6 +93,7 @@
 		F39C7CF9966C4211ABBB59D9 /* BarRulerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BarRulerView.swift; sourceTree = "<group>"; };
 		481B65930AAA40C69F6D203A /* AudioClipView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioClipView.swift; sourceTree = "<group>"; };
 		865AB21BC9B743F8960BCA76 /* RegionEditSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RegionEditSheet.swift; sourceTree = "<group>"; };
+		B8D5F02A3C495E7F0A1B2C3D /* SessionLibraryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionLibraryView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -218,6 +220,7 @@
 		6CE21EB0854C42269161A803 /* Views */ = {
 			isa = PBXGroup;
 			children = (
+				C9E6A13B4D5A6F801B2C3D4E /* Library */,
 				8B1F8A2AF27E445CACFFA683 /* Toolbar */,
 				A02EDD0A666E4485AF669521 /* Tracks */,
 				D1D3725BFF91417D93267F3A /* Timeline */,
@@ -225,6 +228,14 @@
 				08BC6CBF710640E0824ED5B2 /* Export */,
 			);
 			path = Views;
+			sourceTree = "<group>";
+		};
+		C9E6A13B4D5A6F801B2C3D4E /* Library */ = {
+			isa = PBXGroup;
+			children = (
+				B8D5F02A3C495E7F0A1B2C3D /* SessionLibraryView.swift */,
+			);
+			path = Library;
 			sourceTree = "<group>";
 		};
 		8B1F8A2AF27E445CACFFA683 /* Toolbar */ = {
@@ -405,6 +416,7 @@
 				C13912A0561F470587E689A1 /* ArrangeView.swift in Sources */,
 				AA3F04BAEC8C4079B5B5A535 /* TopToolbarView.swift in Sources */,
 				1DD03AB091B54FB4B71346E5 /* TrackListView.swift in Sources */,
+				A7C4E91F2B384D6E9F0A1B2C /* SessionLibraryView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

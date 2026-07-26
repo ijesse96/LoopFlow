@@ -3,7 +3,7 @@ import SwiftUI
 struct TimelineView: View {
     @ObservedObject var vm: ProjectViewModel
 
-    private var totalBars: Int { max(1, vm.project.totalBars) }
+    private var totalBars: Int { max(1, vm.visibleTimelineBars) }
     private var timelineWidth: CGFloat { CGFloat(totalBars) * vm.pixelsPerBar }
     private var rulerHeight: CGFloat {
         ArrangeMetrics.rulerHeight(loopEnabled: vm.project.loopEnabled)
@@ -238,12 +238,28 @@ struct TimelineView: View {
 
     private var playheadLayer: some View {
         let x = vm.xPosition(forBeats: vm.project.secondsToBeats(vm.playheadSeconds))
-        return Rectangle()
-            .fill(AppTheme.playhead)
-            .frame(width: 1.5, height: arrangeHeight)
-            .offset(x: x)
+        return ZStack(alignment: .topLeading) {
+            // ScrollViewReader ignores `.offset` — place the anchor in layout space
+            // so scrollTo follows the real playhead x (not the leading edge).
+            HStack(spacing: 0) {
+                Color.clear.frame(width: max(0, x), height: 1)
+                Color.clear
+                    .frame(width: 1, height: 1)
+                    .id(Self.playheadScrollID)
+                Spacer(minLength: 0)
+            }
+            .frame(width: timelineWidth, height: 1, alignment: .leading)
             .allowsHitTesting(false)
+
+            Rectangle()
+                .fill(AppTheme.playhead)
+                .frame(width: 1.5, height: arrangeHeight)
+                .offset(x: x)
+                .allowsHitTesting(false)
+        }
     }
+
+    static let playheadScrollID = "timelinePlayhead"
 
     @ViewBuilder
     private var snapIndicator: some View {
