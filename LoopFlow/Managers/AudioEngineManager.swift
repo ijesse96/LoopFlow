@@ -110,13 +110,22 @@ final class AudioEngineManager: ObservableObject {
     private var suppressLoopWrapUntilStop = false
 
     /// Round-trip I/O latency for aligning recorded takes to what was heard.
-    /// Prefer engine presentation latencies (session figures often under-report through AVAudioEngine).
+    /// Uses engine presentation latencies which include buffer processing time.
+    /// Session-only figures often under-report actual latency through AVAudioEngine.
     var roundTripLatencySeconds: TimeInterval {
         let session = AVAudioSession.sharedInstance()
         let input = max(session.inputLatency, engine.inputNode.presentationLatency)
         let output = max(session.outputLatency, engine.outputNode.presentationLatency)
-        // Two IO buffers cover player/tap quantum often missing from session-only figures.
-        return max(0, input + output + (2 * session.ioBufferDuration))
+        // Add one buffer duration to account for tap callback timing variance.
+        // Floor at 20ms to handle cases where latency values report 0.
+        return max(0.020, input + output + session.ioBufferDuration)
+    }
+
+    /// Output latency for playhead display compensation during playback.
+    /// Audio scheduled at time T reaches speakers at T + outputLatencySeconds.
+    private var outputLatencySeconds: TimeInterval {
+        let session = AVAudioSession.sharedInstance()
+        return max(0, max(session.outputLatency, engine.outputNode.presentationLatency) + session.ioBufferDuration)
     }
 
     /// User fine-tune from Settings (milliseconds → seconds). Positive = trim more (fix late takes).
@@ -128,6 +137,9 @@ final class AudioEngineManager: ObservableObject {
 
     /// Latency frozen when mic writes armed for the current recording pass.
     private(set) var activeRecordingLatencySeconds: TimeInterval = 0
+    /// How far playhead advanced from region start before writes were enabled.
+    /// Subtracted from latency trim since file doesn't contain that pre-write audio.
+    private(set) var recordingStartOffsetSeconds: TimeInterval = 0
 
     init() {
         setupGraph()
@@ -1188,7 +1200,16 @@ final class AudioEngineManager: ObservableObject {
         if onRecordingPunchIn != nil, playheadSeconds < regionStartSeconds - 0.0001 {
             return
         }
-        activeRecordingLatencySeconds = roundTripLatencySeconds
+        // Calculate how far playhead has advanced since transport started.
+        // The file won't contain audio from before this point, so reduce the
+        // latency trim accordingly (otherwise we'd trim into the actual performance).
+        if let start = playbackStartedHostTime {
+            recordingStartOffsetSeconds = hostTimeToSeconds(mach_absolute_time() - start)
+        } else {
+            recordingStartOffsetSeconds = 0
+        }
+        // Effective latency = round-trip minus the setup time we "missed"
+        activeRecordingLatencySeconds = max(0, roundTripLatencySeconds - recordingStartOffsetSeconds)
         recordingWriteEnabled = true
         if let punch = onRecordingPunchIn {
             onRecordingPunchIn = nil
@@ -1391,21 +1412,31 @@ final class AudioEngineManager: ObservableObject {
         }
 
         if isPlaying || isRecording {
-            let position = playbackStartedOffset + elapsed
+            let rawPosition = playbackStartedOffset + elapsed
             let regionEnd = regionStartSeconds + regionDurationSeconds
+
+            // During playback (not recording), compensate for output latency so the
+            // playhead shows where audio is actually being heard, not where it's buffered.
+            let displayPosition: Double
+            if isRecording {
+                displayPosition = rawPosition
+            } else {
+                displayPosition = max(playbackStartedOffset, rawPosition - outputLatencySeconds)
+            }
 
             // Punch-in after lead-in: arm mic writes when the playhead enters the loop region.
             if isRecording, onRecordingPunchIn != nil, !recordingWriteEnabled,
-               position >= regionStartSeconds - 0.0001 {
-                playheadSeconds = max(position, regionStartSeconds)
+               rawPosition >= regionStartSeconds - 0.0001 {
+                playheadSeconds = max(rawPosition, regionStartSeconds)
                 armRecordingWritesAlignedToClock()
             }
 
             // Loop wrap only when playing through the loop end — not when starting past it
             // or after the user scrubbed the playhead during this transport run.
+            // Use raw position for boundary detection (audio buffer timing).
             let shouldWrapLoop = (loopEnabled || isRecording)
                 && !suppressLoopWrapUntilStop
-                && position >= regionEnd
+                && rawPosition >= regionEnd
                 && playbackStartedOffset < regionEnd - 0.001
 
             if shouldWrapLoop {
@@ -1413,7 +1444,7 @@ final class AudioEngineManager: ObservableObject {
                 // After boundary, playhead/host clock are reset; show region start this frame.
                 playheadSeconds = regionStartSeconds
             } else {
-                playheadSeconds = position
+                playheadSeconds = displayPosition
                 let stopAt: Double
                 if isRecording {
                     stopAt = regionEnd
@@ -1422,7 +1453,7 @@ final class AudioEngineManager: ObservableObject {
                 } else {
                     stopAt = max(regionEnd, arrangementEndSeconds, playbackStartedOffset + 0.05)
                 }
-                if position >= stopAt {
+                if rawPosition >= stopAt {
                     stop()
                     return
                 }
@@ -1430,7 +1461,10 @@ final class AudioEngineManager: ObservableObject {
 
             if metronomeEnabled, isPlaying || isRecording {
                 let beatDuration = TimelineManager.secondsPerBeat(bpm: bpm)
-                let globalBeat = Int(playheadSeconds / beatDuration)
+                // Use raw position so metronome stays in sync with clip audio (both go
+                // through the same output buffer). The visual playhead is separately
+                // compensated to match what the user hears.
+                let globalBeat = Int(rawPosition / beatDuration)
                 if globalBeat != lastMetronomeBeat {
                     lastMetronomeBeat = globalBeat
                     fireClick(accent: globalBeat % timeSignature.beatsPerBar == 0)
