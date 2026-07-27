@@ -110,13 +110,14 @@ final class AudioEngineManager: ObservableObject {
     private var suppressLoopWrapUntilStop = false
 
     /// Round-trip I/O latency for aligning recorded takes to what was heard.
-    /// Prefer engine presentation latencies (session figures often under-report through AVAudioEngine).
+    /// Uses engine presentation latencies which include buffer processing time.
+    /// Session-only figures often under-report actual latency through AVAudioEngine.
     var roundTripLatencySeconds: TimeInterval {
         let session = AVAudioSession.sharedInstance()
         let input = max(session.inputLatency, engine.inputNode.presentationLatency)
         let output = max(session.outputLatency, engine.outputNode.presentationLatency)
-        // Two IO buffers cover player/tap quantum often missing from session-only figures.
-        return max(0, input + output + (2 * session.ioBufferDuration))
+        // presentationLatency includes buffer delays; avoid double-counting ioBufferDuration.
+        return max(0, input + output)
     }
 
     /// Output latency for playhead display compensation during playback.
@@ -1447,8 +1448,10 @@ final class AudioEngineManager: ObservableObject {
 
             if metronomeEnabled, isPlaying || isRecording {
                 let beatDuration = TimelineManager.secondsPerBeat(bpm: bpm)
-                // Use display position so metronome clicks align with the visible playhead.
-                let globalBeat = Int(displayPosition / beatDuration)
+                // Use raw position so metronome stays in sync with clip audio (both go
+                // through the same output buffer). The visual playhead is separately
+                // compensated to match what the user hears.
+                let globalBeat = Int(rawPosition / beatDuration)
                 if globalBeat != lastMetronomeBeat {
                     lastMetronomeBeat = globalBeat
                     fireClick(accent: globalBeat % timeSignature.beatsPerBar == 0)
