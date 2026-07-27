@@ -116,8 +116,9 @@ final class AudioEngineManager: ObservableObject {
         let session = AVAudioSession.sharedInstance()
         let input = max(session.inputLatency, engine.inputNode.presentationLatency)
         let output = max(session.outputLatency, engine.outputNode.presentationLatency)
-        // presentationLatency includes buffer delays; avoid double-counting ioBufferDuration.
-        return max(0, input + output)
+        // Add one buffer duration to account for tap callback timing variance.
+        // Floor at 20ms to handle cases where latency values report 0.
+        return max(0.020, input + output + session.ioBufferDuration)
     }
 
     /// Output latency for playhead display compensation during playback.
@@ -136,6 +137,9 @@ final class AudioEngineManager: ObservableObject {
 
     /// Latency frozen when mic writes armed for the current recording pass.
     private(set) var activeRecordingLatencySeconds: TimeInterval = 0
+    /// How far playhead advanced from region start before writes were enabled.
+    /// Subtracted from latency trim since file doesn't contain that pre-write audio.
+    private(set) var recordingStartOffsetSeconds: TimeInterval = 0
 
     init() {
         setupGraph()
@@ -1196,7 +1200,16 @@ final class AudioEngineManager: ObservableObject {
         if onRecordingPunchIn != nil, playheadSeconds < regionStartSeconds - 0.0001 {
             return
         }
-        activeRecordingLatencySeconds = roundTripLatencySeconds
+        // Calculate how far playhead has advanced since transport started.
+        // The file won't contain audio from before this point, so reduce the
+        // latency trim accordingly (otherwise we'd trim into the actual performance).
+        if let start = playbackStartedHostTime {
+            recordingStartOffsetSeconds = hostTimeToSeconds(mach_absolute_time() - start)
+        } else {
+            recordingStartOffsetSeconds = 0
+        }
+        // Effective latency = round-trip minus the setup time we "missed"
+        activeRecordingLatencySeconds = max(0, roundTripLatencySeconds - recordingStartOffsetSeconds)
         recordingWriteEnabled = true
         if let punch = onRecordingPunchIn {
             onRecordingPunchIn = nil
