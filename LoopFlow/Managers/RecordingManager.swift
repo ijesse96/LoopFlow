@@ -425,7 +425,17 @@ final class RecordingManager: ObservableObject {
                 usable.append(take)
             }
         }
-        guard var chosen = usable.max(by: { $0.takeNumber < $1.takeNumber }) else {
+        let expectedSeconds = project.currentRegion.durationSeconds(
+            bpm: project.bpm,
+            timeSignature: project.timeSignature
+        )
+        // While armed, prefer the newest COMPLETED loop over the just-started partial file —
+        // otherwise a good take "expires" seconds after the wrap because the new in-progress
+        // WAV outranks it by take number. After Stop, a deliberately short take still wins.
+        let fullTakes = usable.filter { $0.durationSeconds >= expectedSeconds * 0.9 }
+        let preferFull = phase == .loopRecording
+        guard var chosen = (preferFull ? fullTakes.max(by: { $0.takeNumber < $1.takeNumber }) : nil)
+            ?? usable.max(by: { $0.takeNumber < $1.takeNumber }) else {
             statusMessage = "Empty recording — check mic"
             if phase == .loopRecording, activeTake == nil {
                 currentTakeNumber = nextTakeNumber(in: project)
@@ -435,10 +445,6 @@ final class RecordingManager: ObservableObject {
         }
         // Prefer an already-accepted take only when the newer file is aborted vs current region length
         // (Keep → Keep+Next race), not when the user deliberately recorded a shorter region.
-        let expectedSeconds = project.currentRegion.durationSeconds(
-            bpm: project.bpm,
-            timeSignature: project.timeSignature
-        )
         if let accepted = usable.filter(\.isAccepted).max(by: { $0.takeNumber < $1.takeNumber }),
            accepted.id != chosen.id,
            chosen.durationSeconds < max(0.25, expectedSeconds * 0.25) {
