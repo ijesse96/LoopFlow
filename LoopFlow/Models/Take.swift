@@ -10,6 +10,8 @@ struct Take: Codable, Identifiable, Equatable {
     var durationSeconds: Double
     /// Round-trip latency snapshot from when mic writes armed (0 = unknown / legacy).
     var recordedLatencySeconds: Double
+    /// Playhead advance from arm → first tap write (0 = unknown / legacy).
+    var recordedWriteSkewSeconds: Double
 
     init(
         id: UUID = UUID(),
@@ -19,7 +21,8 @@ struct Take: Codable, Identifiable, Equatable {
         createdAt: Date = Date(),
         isAccepted: Bool = false,
         durationSeconds: Double = 0,
-        recordedLatencySeconds: Double = 0
+        recordedLatencySeconds: Double = 0,
+        recordedWriteSkewSeconds: Double = 0
     ) {
         self.id = id
         self.regionIndex = regionIndex
@@ -29,10 +32,12 @@ struct Take: Codable, Identifiable, Equatable {
         self.isAccepted = isAccepted
         self.durationSeconds = durationSeconds
         self.recordedLatencySeconds = recordedLatencySeconds
+        self.recordedWriteSkewSeconds = recordedWriteSkewSeconds
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, regionIndex, takeNumber, relativePath, createdAt, isAccepted, durationSeconds, recordedLatencySeconds
+        case id, regionIndex, takeNumber, relativePath, createdAt, isAccepted, durationSeconds
+        case recordedLatencySeconds, recordedWriteSkewSeconds
     }
 
     init(from decoder: Decoder) throws {
@@ -45,5 +50,6 @@ struct Take: Codable, Identifiable, Equatable {
         isAccepted = try c.decode(Bool.self, forKey: .isAccepted)
         durationSeconds = try c.decode(Double.self, forKey: .durationSeconds)
         recordedLatencySeconds = try c.decodeIfPresent(Double.self, forKey: .recordedLatencySeconds) ?? 0
+        recordedWriteSkewSeconds = try c.decodeIfPresent(Double.self, forKey: .recordedWriteSkewSeconds) ?? 0
     }
 }

@@ -89,9 +89,7 @@ struct TopToolbarView: View {
     private var tempoGroup: some View {
         HStack(spacing: 8) {
             Button {
-                vm.project.metronomeEnabled.toggle()
-                vm.applyAudioFromProject()
-                vm.autosave()
+                vm.setMetronomeEnabled(!vm.project.metronomeEnabled)
             } label: {
                 Image(systemName: "metronome")
                     .foregroundStyle(vm.project.metronomeEnabled ? AppTheme.accent : AppTheme.textSecondary)

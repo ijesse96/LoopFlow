@@ -277,6 +277,22 @@ final class ProjectViewModel: ObservableObject {
     }
 
     /// Drag playhead scrubber on the ruler (does not change loop selection).
+    func beginPlayheadScrub() {
+        audio.beginPlayheadScrub()
+    }
+
+    func updatePlayheadScrub(toBeats beats: Double) {
+        let clampedBeats = max(0, beats)
+        let seconds = project.beatsToSeconds(clampedBeats)
+        let clamp = recording.phase == .loopRecording && project.loopEnabled
+        audio.updatePlayheadScrub(to: seconds, clampToLoop: clamp)
+    }
+
+    func endPlayheadScrub() {
+        audio.endPlayheadScrub()
+    }
+
+    /// One-shot scrub (nudge arrows). Prefer begin/update/end for ruler drags.
     func scrubPlayhead(toBeats beats: Double) {
         let clampedBeats = max(0, beats)
         let seconds = project.beatsToSeconds(clampedBeats)
@@ -392,6 +408,14 @@ final class ProjectViewModel: ObservableObject {
         } catch {
             recording.statusMessage = error.localizedDescription
         }
+    }
+
+    /// Metronome on/off is a mixer mute only — it must never touch the transport graph
+    /// (a full applyAudioFromProject mid-play restarts players and yanks the playhead).
+    func setMetronomeEnabled(_ enabled: Bool) {
+        project.metronomeEnabled = enabled
+        audio.setMetronomeVolume(enabled)
+        autosave()
     }
 
     func applyAudioFromProject() {
@@ -668,6 +692,7 @@ final class ProjectViewModel: ObservableObject {
         } else {
             project.tracks[idx].inputMonitorEnabled = false
             applyInputMonitor()
+            refreshClipPlaybackSchedule()
             autosave()
         }
     }
@@ -1241,16 +1266,16 @@ final class ProjectViewModel: ObservableObject {
         let path = found.clip.sourceRelativePath
         let trackIdx = found.trackIndex
         let trackType = project.tracks[trackIdx].type
-        project.tracks[trackIdx].takes.removeAll { $0.relativePath == path }
         project.tracks[trackIdx].removeClip(id: id)
         selectClip(nil)
 
-        // Split shares one file across halves — only delete media when nothing references it.
+        // Split shares one file across halves — only drop take + media when nothing references it.
         let stillReferenced = project.tracks.contains { track in
             track.clips.contains { $0.sourceRelativePath == path }
         }
         refreshClipPlaybackSchedule()
         if !stillReferenced {
+            project.tracks[trackIdx].takes.removeAll { $0.relativePath == path }
             let url = storage.absoluteURL(for: path, projectID: project.id)
             try? FileManager.default.removeItem(at: url)
         }

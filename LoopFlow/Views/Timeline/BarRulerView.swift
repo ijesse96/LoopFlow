@@ -104,6 +104,7 @@ struct BarRulerView: View {
             .onChanged { value in
                 if scrubOriginBeats == nil {
                     scrubOriginBeats = vm.project.secondsToBeats(vm.playheadSeconds)
+                    vm.beginPlayheadScrub()
                 }
                 let originBeats = scrubOriginBeats ?? 0
                 // Dampened scrub: finger must travel farther for the same timeline move
@@ -119,9 +120,10 @@ struct BarRulerView: View {
                         UIImpactFeedbackGenerator(style: .light).impactOccurred()
                     }
                 }
-                vm.scrubPlayhead(toBeats: max(0, target))
+                vm.updatePlayheadScrub(toBeats: max(0, target))
             }
             .onEnded { _ in
+                vm.endPlayheadScrub()
                 scrubOriginBeats = nil
                 lastSnappedBeat = nil
             }

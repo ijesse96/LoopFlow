@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import os
 
 enum RecordingPhase: Equatable {
     case idle
@@ -180,30 +181,31 @@ final class RecordingManager: ObservableObject {
         // 1) Exclude kept take (soft-mute when mic path already live).
         onClipScheduleRefresh?()
 
-        // 2) Start or lightly restart transport before enabling monitor writes.
-        do {
-            if audio.isPlaying {
-                audio.jumpToRegionStartPreservingPlayback(armRecordingOnStart: false)
-            } else {
-                try audio.play(fromRegionStart: true, armRecordingOnStart: false)
-            }
-        } catch {
-            statusMessage = error.localizedDescription
+        // 2) Open mic file with writes gated BEFORE starting the musical clock.
+        //    Opening after play() left file sample 0 after region t0 (late Keep landing).
+        guard openNewTakeFile(), audio.isRecording else {
             phase = .idle
             audio.releaseCaptureHold()
-            return
-        }
-
-        // 3) Open mic file + enable monitor after players are running.
-        guard openNewTakeFile(), audio.isRecording else {
-            audio.stop()
-            phase = .idle
             if statusMessage.isEmpty || statusMessage.hasPrefix("Recording") {
                 statusMessage = "Could not start recording"
             }
             return
         }
-        audio.armRecordingWritesAlignedToClock()
+
+        // 3) Start transport and arm writes at the same host-time zero.
+        do {
+            if audio.isPlaying {
+                audio.jumpToRegionStartPreservingPlayback(armRecordingOnStart: true)
+            } else {
+                try audio.play(fromRegionStart: true, armRecordingOnStart: true)
+            }
+        } catch {
+            statusMessage = error.localizedDescription
+            phase = .idle
+            audio.stop()
+            return
+        }
+
         statusMessage = replacingKept
             ? "Recording take \(currentTakeNumber) — Keep replaces kept clip (Undo restores)"
             : "Recording take \(currentTakeNumber)"
@@ -349,6 +351,7 @@ final class RecordingManager: ObservableObject {
         openNewTakeFile()
         if var take = completed {
             take.recordedLatencySeconds = audio.activeRecordingLatencySeconds
+            take.recordedWriteSkewSeconds = audio.activeRecordingWriteSkewSeconds
             if let url = try? storage.takeFileURL(projectID: projectID, relativePath: take.relativePath) {
                 take.durationSeconds = audio.measureTakeDuration(url: url)
             }
@@ -363,6 +366,7 @@ final class RecordingManager: ObservableObject {
         activeTake = nil
         audio.closeCurrentRecordingFile()
         take.recordedLatencySeconds = audio.activeRecordingLatencySeconds
+        take.recordedWriteSkewSeconds = audio.activeRecordingWriteSkewSeconds
         if let url = try? storage.takeFileURL(projectID: projectID, relativePath: take.relativePath) {
             take.durationSeconds = audio.measureTakeDuration(url: url)
         }
@@ -383,22 +387,6 @@ final class RecordingManager: ObservableObject {
         let endBeats = project.barToBeats(project.selectionEndBar)
         let selectionHasClip = project.tracks[trackIdx].clips.contains {
             $0.timelineStartBeats >= startBeats - 0.001 && $0.timelineStartBeats < endBeats - 0.001
-        }
-
-        // Keep+Next after Keep: don't re-keep / replace — just advance.
-        if advance, selectionHasClip {
-            if let take = finalizeActiveTake() {
-                // Drop empty aborted take; keep longer alternates as non-accepted.
-                if take.durationSeconds > 0.05 {
-                    var stored = take
-                    stored.isAccepted = false
-                    if !project.tracks[trackIdx].takes.contains(where: { $0.id == stored.id }) {
-                        project.tracks[trackIdx].takes.append(stored)
-                    }
-                }
-            }
-            advanceRegion(project: &project, continueRecording: phase == .loopRecording)
-            return true
         }
 
         let finalized = finalizeActiveTake()
@@ -481,27 +469,31 @@ final class RecordingManager: ObservableObject {
             return false
         }
 
+        let hadExistingClip = selectionHasClip
+
+        // Keep (same region): stop capture before placement so onset scan can run
+        // without blocking a live mic monitor. Keep+Next stays armed (latency-only trim).
+        let stoppingForReview = !advance && phase == .loopRecording
+        if stoppingForReview {
+            audio.setRecordingPunchInHandler(nil)
+            audio.stop()
+            audio.setLoopBoundaryHandler(nil)
+            phase = .idle
+        }
+
         // Align to what was heard: instrumental arrives late (output) and mic late (input).
+        // Latency-only trim — do not let find-first-sound shrink sourceStart (that parks takes late).
+        // WAV sample 0 is trimmed to the write-arm instant in the tap, so arm→first-write
+        // skew is already compensated at the source and must not be subtracted again here.
         let baseLatency = chosen.recordedLatencySeconds > 0
             ? chosen.recordedLatencySeconds
             : audio.roundTripLatencySeconds
         let latency = max(0, baseLatency + audio.recordingLatencyOffsetSeconds)
-        var sourceStart = min(latency, max(0, duration - 0.05))
+        let sourceStart = min(latency, max(0, duration - 0.05))
+        AudioEngineManager.transportLog.info(
+            "keep: take=\(chosen.takeNumber) region=\(self.regionIndex) dur=\(duration, format: .fixed(precision: 3))s trim=\(sourceStart * 1000, format: .fixed(precision: 1))ms skew=\(chosen.recordedWriteSkewSeconds * 1000, format: .fixed(precision: 1))ms"
+        )
 
-        // Onset scan is heavy — never block the main thread while the mic monitor is live.
-        let stillArmed = phase == .loopRecording
-        if !stillArmed,
-           let takeURL,
-           let onset = TimelineManager.findFirstSoundTime(
-            url: takeURL,
-            maxScanSeconds: min(0.35, max(0.05, duration))
-           ),
-           onset > 0.005,
-           onset < 0.25 {
-            sourceStart = min(max(latency, onset), max(0, duration - 0.05))
-        }
-
-        let hadExistingClip = selectionHasClip
         // Replace any clip that starts inside the current selection.
         project.tracks[trackIdx].clips.removeAll {
             $0.timelineStartBeats >= startBeats - 0.001 && $0.timelineStartBeats < endBeats - 0.001
@@ -516,22 +508,20 @@ final class RecordingManager: ObservableObject {
         )
         project.tracks[trackIdx].clips.append(newClip)
 
-        statusMessage = hadExistingClip
-            ? "Kept take \(chosen.takeNumber) — replaced previous (Undo to restore)"
-            : "Kept take \(chosen.takeNumber)"
-
         if advance {
             // Keep+Next: advance and keep recording when still armed.
+            statusMessage = hadExistingClip
+                ? "Kept take \(chosen.takeNumber) — replaced previous (Undo to restore)"
+                : "Kept take \(chosen.takeNumber)"
             advanceRegion(project: &project, continueRecording: phase == .loopRecording)
-        } else if phase == .loopRecording {
-            // Keep (same region): stop recording so the VM can play back for review.
-            audio.setRecordingPunchInHandler(nil)
-            audio.stop()
-            audio.setLoopBoundaryHandler(nil)
-            phase = .idle
+        } else if stoppingForReview {
             statusMessage = hadExistingClip
                 ? "Kept take \(chosen.takeNumber) — replaced previous · review"
                 : "Kept take \(chosen.takeNumber) — playing review"
+        } else {
+            statusMessage = hadExistingClip
+                ? "Kept take \(chosen.takeNumber) — replaced previous (Undo to restore)"
+                : "Kept take \(chosen.takeNumber)"
         }
 
         if let takeURL {
@@ -590,6 +580,10 @@ final class RecordingManager: ObservableObject {
         }
         regionIndex = project.selectionStartBar
         audio.setActiveRegion(project.currentRegion, resetPlayhead: true)
+        // Play-only navigation: audio follows the jump (armed record re-anchors below).
+        if !(continueRecording && phase == .loopRecording) {
+            audio.resyncPlaybackToRegionStartIfPlaying()
+        }
         statusMessage = "Bars \(project.selectionStartBar)–\(project.selectionEndBar - 1)"
         onAdvanceRegion?()
 
@@ -599,6 +593,7 @@ final class RecordingManager: ObservableObject {
                 statusMessage = "Could not continue recording"
                 return
             }
+            onClipScheduleRefresh?()
             audio.continueRecordingAtRegionStart()
             statusMessage = "Recording take \(currentTakeNumber)"
         }
@@ -608,9 +603,13 @@ final class RecordingManager: ObservableObject {
         project.retreatSelection()
         regionIndex = project.selectionStartBar
         audio.setActiveRegion(project.currentRegion, resetPlayhead: true)
+        if phase != .loopRecording {
+            audio.resyncPlaybackToRegionStartIfPlaying()
+        }
         if phase == .loopRecording {
             currentTakeNumber = nextTakeNumber(in: project)
             if openNewTakeFile() {
+                onClipScheduleRefresh?()
                 audio.continueRecordingAtRegionStart()
                 statusMessage = "Recording take \(currentTakeNumber)"
             } else {

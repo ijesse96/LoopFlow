@@ -37,11 +37,10 @@ struct SettingsView: View {
                         .font(.footnote)
                         .foregroundStyle(AppTheme.textSecondary)
 
-                    Toggle("Metronome", isOn: $vm.project.metronomeEnabled)
-                        .onChange(of: vm.project.metronomeEnabled) { _, _ in
-                            vm.applyAudioFromProject()
-                            vm.autosave()
-                        }
+                    Toggle("Metronome", isOn: Binding(
+                        get: { vm.project.metronomeEnabled },
+                        set: { vm.setMetronomeEnabled($0) }
+                    ))
 
                     Toggle("Loop Region", isOn: Binding(
                         get: { vm.project.loopEnabled },
@@ -53,7 +52,7 @@ struct SettingsView: View {
                     Stepper(value: $vm.recordingLatencyOffsetMs, in: -80...80, step: 5) {
                         Text("Latency offset: \(vm.recordingLatencyOffsetMs) ms")
                     }
-                    Text("If kept takes play late, increase this. If early, decrease. Applies on Keep.")
+                    Text("If kept takes play late, increase this. If early, decrease. Applies on Keep. Leave at 0 when auto-align feels tight.")
                         .font(.footnote)
                         .foregroundStyle(AppTheme.textSecondary)
                 }

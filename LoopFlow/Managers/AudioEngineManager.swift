@@ -2,6 +2,7 @@ import Foundation
 @preconcurrency import AVFoundation
 import UIKit
 import QuartzCore
+import os
 
 /// A non-instrumental clip ready for live playback scheduling.
 struct ScheduledClip: Equatable {
@@ -12,6 +13,14 @@ struct ScheduledClip: Equatable {
     var gain: Float
     /// Track pan −1…1 (left…right).
     var pan: Float
+
+    /// Identity for schedule rebuilds — ignores live mix (gain/pan).
+    func matchesContent(_ other: ScheduledClip) -> Bool {
+        url == other.url
+            && abs(sourceStartSeconds - other.sourceStartSeconds) < 1e-6
+            && abs(sourceEndSeconds - other.sourceEndSeconds) < 1e-6
+            && abs(timelineStartSeconds - other.timelineStartSeconds) < 1e-6
+    }
 }
 
 @MainActor
@@ -52,9 +61,12 @@ final class AudioEngineManager: ObservableObject {
     /// Path of the currently loaded instrumental (skip reload when unchanged).
     private var instrumentalLoadedURL: URL?
     private var scheduledClips: [ScheduledClip] = []
-    private var clipFileCache: [URL: AVAudioFile] = [:]
-    /// Which file each clip player is currently serving (for soft mute without graph rebuild).
-    private var clipPlayerSourceURLs: [URL?] = Array(repeating: nil, count: 8)
+    /// Per-player readers so split halves sharing a URL don't share mutable `AVAudioFile` state.
+    private var clipFileCache: [Int: (url: URL, file: AVAudioFile)] = [:]
+    /// Exact clip each player is serving (soft-mute by identity, not shared path).
+    private var clipPlayerScheduledClips: [ScheduledClip?] = Array(repeating: nil, count: 8)
+    /// Split / bound changes while mic is live — rebuild players once the mic path goes idle.
+    private var pendingClipHardRefresh = false
     /// Non-destructive instrumental window mapped onto the timeline.
     private var instrumentalSourceStartSeconds: Double = 0
     private var instrumentalSourceEndSeconds: Double = 0
@@ -68,6 +80,14 @@ final class AudioEngineManager: ObservableObject {
     private var loopEnabled = true
     private var playbackStartedHostTime: UInt64?
     private var playbackStartedOffset: Double = 0
+    /// Region jumped while transport is live but players not yet restarted — the old player
+    /// sample clock is stale, so displayTick must not derive a position until re-anchor.
+    private var transportReanchorPending = false
+    /// Ruler scrub in progress — playhead moves without per-frame reschedule.
+    private var isPlayheadScrubbing = false
+    /// Resume transport with one seek when scrub ends.
+    private var resumePlaybackAfterPlayheadScrub = false
+    private var playheadScrubClampToLoop = false
 
     private var recordingFile: AVAudioFile?
     /// Nonisolated handle for the audio-thread tap write (mirrors `recordingFile`).
@@ -76,6 +96,11 @@ final class AudioEngineManager: ObservableObject {
     private nonisolated(unsafe) var recordingWriteFormat: AVAudioFormat?
     /// Gate so close/rotate can finalize the WAV before the tap writes again.
     private nonisolated(unsafe) var recordingWriteEnabled = false
+    /// Host time when writes armed — the musical zero the first written buffer is trimmed to.
+    private nonisolated(unsafe) var recordingArmHostTime: UInt64 = 0
+    /// Diagnostic: seconds from arm → first written tap buffer (−1 = not captured yet).
+    /// The first buffer is trimmed to the arm instant, so this no longer shifts takes.
+    private nonisolated(unsafe) var recordingWriteSkewSeconds: TimeInterval = -1
     /// Latest mic peak from the audio-thread tap (published on the display link).
     private nonisolated(unsafe) var tapPeakLevel: Float = 0
     /// Deferred tap write error (published on the display link — never hop MainActor from the tap).
@@ -109,14 +134,23 @@ final class AudioEngineManager: ObservableObject {
     /// User scrubbed while playing — don't wrap/stop at the loop end until the next play/stop.
     private var suppressLoopWrapUntilStop = false
 
+    /// Mic meter/record tap size (installTap only — not part of Keep trim after write-arm align).
+    static let recordingTapBufferFrames: AVAudioFrameCount = 1024
+
+    /// Transport/record timing diagnostics (Console.app / Xcode: subsystem LoopFlow).
+    static let transportLog = Logger(subsystem: "LoopFlow", category: "Transport")
+
     /// Round-trip I/O latency for aligning recorded takes to what was heard.
     /// Prefer engine presentation latencies (session figures often under-report through AVAudioEngine).
+    /// Include two IO buffers (play + capture) and the mic tap quantum — presentation latencies
+    /// alone under-estimate Keep trim on device (~tens of ms late without this).
     var roundTripLatencySeconds: TimeInterval {
         let session = AVAudioSession.sharedInstance()
         let input = max(session.inputLatency, engine.inputNode.presentationLatency)
         let output = max(session.outputLatency, engine.outputNode.presentationLatency)
-        // Two IO buffers cover player/tap quantum often missing from session-only figures.
-        return max(0, input + output + (2 * session.ioBufferDuration))
+        let rate = sampleRate > 0 ? sampleRate : max(session.sampleRate, 44_100)
+        let tapSeconds = Double(Self.recordingTapBufferFrames) / rate
+        return max(0, input + output + session.ioBufferDuration * 2 + tapSeconds)
     }
 
     /// User fine-tune from Settings (milliseconds → seconds). Positive = trim more (fix late takes).
@@ -128,6 +162,11 @@ final class AudioEngineManager: ObservableObject {
 
     /// Latency frozen when mic writes armed for the current recording pass.
     private(set) var activeRecordingLatencySeconds: TimeInterval = 0
+    /// Measured arm → first-write delay for the current pass (0 if not yet captured).
+    var activeRecordingWriteSkewSeconds: TimeInterval {
+        let skew = recordingWriteSkewSeconds
+        return skew >= 0 ? skew : 0
+    }
 
     init() {
         setupGraph()
@@ -408,6 +447,7 @@ final class AudioEngineManager: ObservableObject {
         desiredMonitorPan = max(-1, min(1, pan))
         refreshRouteState()
         applyDesiredMonitor()
+        flushPendingClipHardRefreshIfNeeded()
     }
 
     /// Keep a mic tap for level metering (e.g. while Input Monitor is armed).
@@ -421,6 +461,12 @@ final class AudioEngineManager: ObservableObject {
         if !enabled && !isRecording {
             inputLevel = 0
         }
+        flushPendingClipHardRefreshIfNeeded()
+    }
+
+    private var isMicPathLive: Bool {
+        isRecording || desiredMonitorEnabled || wantsInputMetering || recordingFile != nil
+            || vocalMonitorMixer.outputVolume > 0.001
     }
 
     private func applyDesiredMonitor() {
@@ -538,6 +584,8 @@ final class AudioEngineManager: ObservableObject {
             scheduleInstrumentalSegment(at: playheadSeconds)
             if ensureEngineRunning() {
                 instrumentalPlayer.play()
+                // Instrumental is the preferred transport clock; its sample time just reset.
+                anchorPlaybackClock(at: playheadSeconds)
             }
         }
     }
@@ -558,24 +606,72 @@ final class AudioEngineManager: ObservableObject {
             return
         }
 
+        // Same clips, only gain/pan changed — update running players without stop/reschedule.
+        if Self.clipContentMatches(next, scheduledClips) {
+            scheduledClips = next
+            applyLiveClipMix(next)
+            return
+        }
+
         let previous = scheduledClips
-        let removed = previous.filter { !next.contains($0) }
+        let removed = previous.filter { old in !next.contains(where: { $0.matchesContent(old) }) }
+        // Record-track exclude is removals-only; split/trim adds or changes bounds.
+        let isRemovalsOnly = next.allSatisfy { new in previous.contains(where: { $0.matchesContent(new) }) }
 
         scheduledClips = next
 
         // Soft-mute whenever the mic path is live — not only after isRecording flips.
         // Never rebuild clip players under a live monitor (static lands in the record tap too).
-        let micLive = isRecording || desiredMonitorEnabled || wantsInputMetering || recordingFile != nil
-            || vocalMonitorMixer.outputVolume > 0.001
-        if micLive {
+        if isMicPathLive {
             if !removed.isEmpty {
                 silenceScheduledClips(removed)
             }
-            // Defer adds until the next idle refresh — record-track exclude is removals-only.
+            if !isRemovalsOnly {
+                pendingClipHardRefresh = true
+            }
             return
         }
 
-        // Drop cached readers so re-recorded files reopen fresh.
+        performClipHardRefresh()
+    }
+
+    /// True when both schedules list the same clip content (order-independent), ignoring gain/pan.
+    private static func clipContentMatches(_ a: [ScheduledClip], _ b: [ScheduledClip]) -> Bool {
+        guard a.count == b.count else { return false }
+        var remaining = b
+        for clip in a {
+            guard let idx = remaining.firstIndex(where: { $0.matchesContent(clip) }) else { return false }
+            remaining.remove(at: idx)
+        }
+        return remaining.isEmpty
+    }
+
+    /// Push gain/pan onto already-scheduled players without tearing them down.
+    private func applyLiveClipMix(_ next: [ScheduledClip]) {
+        for i in clipPlayers.indices {
+            guard let serving = clipPlayerScheduledClips[i] else { continue }
+            guard let updated = next.first(where: { $0.matchesContent(serving) }) else { continue }
+            clipPlayers[i].volume = max(0, min(1, updated.gain))
+            clipPlayers[i].pan = max(-1, min(1, updated.pan))
+            clipPlayerScheduledClips[i] = updated
+        }
+    }
+
+    /// Mute/stop players serving removed clips without tearing down the rest of the graph.
+    private func silenceScheduledClips(_ removed: [ScheduledClip]) {
+        for i in clipPlayers.indices {
+            guard let serving = clipPlayerScheduledClips[i],
+                  removed.contains(where: { $0.matchesContent(serving) }) else { continue }
+            clipPlayers[i].volume = 0
+            clipPlayers[i].stop()
+            clipPlayerScheduledClips[i] = nil
+            clipFileCache.removeValue(forKey: i)
+        }
+    }
+
+    private func performClipHardRefresh() {
+        pendingClipHardRefresh = false
+        // Drop cached readers so re-recorded / re-split files reopen fresh.
         clipFileCache.removeAll()
         let transportActive = isPlaying || isRecording
         if transportActive {
@@ -583,23 +679,18 @@ final class AudioEngineManager: ObservableObject {
             if !isCountingIn {
                 let count = scheduleClips(at: playheadSeconds)
                 startClipPlayers(count: count)
+                // With no bed running, a clip player is the transport clock — its sample
+                // time just reset, so re-anchor to keep the playhead where it is.
+                if !instrumentalPlayer.isPlaying {
+                    anchorPlaybackClock(at: playheadSeconds)
+                }
             }
         }
     }
 
-    /// Mute/stop players serving removed clips without tearing down the rest of the graph.
-    private func silenceScheduledClips(_ removed: [ScheduledClip]) {
-        let removedPaths = Set(removed.map { $0.url.standardizedFileURL.path })
-        for i in clipPlayers.indices {
-            guard let url = clipPlayerSourceURLs[i],
-                  removedPaths.contains(url.standardizedFileURL.path) else { continue }
-            clipPlayers[i].volume = 0
-            clipPlayers[i].stop()
-            clipPlayerSourceURLs[i] = nil
-        }
-        for clip in removed {
-            clipFileCache.removeValue(forKey: clip.url)
-        }
+    private func flushPendingClipHardRefreshIfNeeded() {
+        guard pendingClipHardRefresh, !isMicPathLive else { return }
+        performClipHardRefresh()
     }
 
     /// Map timeline time → file window for the instrumental clip.
@@ -608,9 +699,20 @@ final class AudioEngineManager: ObservableObject {
         sourceEndSeconds: Double,
         timelineStartSeconds: Double
     ) {
-        instrumentalSourceStartSeconds = max(0, sourceStartSeconds)
-        instrumentalSourceEndSeconds = max(instrumentalSourceStartSeconds + 0.05, sourceEndSeconds)
-        instrumentalTimelineStartSeconds = max(0, timelineStartSeconds)
+        let newSourceStart = max(0, sourceStartSeconds)
+        let newSourceEnd = max(newSourceStart + 0.05, sourceEndSeconds)
+        let newTimelineStart = max(0, timelineStartSeconds)
+        // No-op remaps (metronome toggle / applyAudioFromProject) must not restart the bed
+        // mid-transport — that resets the player sample clock and yanks the playhead.
+        if instrumentalClipMappingEnabled,
+           abs(instrumentalSourceStartSeconds - newSourceStart) < 1e-6,
+           abs(instrumentalSourceEndSeconds - newSourceEnd) < 1e-6,
+           abs(instrumentalTimelineStartSeconds - newTimelineStart) < 1e-6 {
+            return
+        }
+        instrumentalSourceStartSeconds = newSourceStart
+        instrumentalSourceEndSeconds = newSourceEnd
+        instrumentalTimelineStartSeconds = newTimelineStart
         instrumentalClipMappingEnabled = true
         rescheduleInstrumentalIfTransportActive()
     }
@@ -630,6 +732,9 @@ final class AudioEngineManager: ObservableObject {
         guard ensureEngineRunning() else { return }
         scheduleInstrumentalSegment(at: playheadSeconds)
         instrumentalPlayer.play()
+        // The instrumental player is the preferred transport clock and its sample time just
+        // reset to zero — re-anchor or the playhead snaps back to the old play origin.
+        anchorPlaybackClock(at: playheadSeconds)
     }
 
     func updateTransportContext(
@@ -649,6 +754,14 @@ final class AudioEngineManager: ObservableObject {
         regionDurationSeconds = region.durationSeconds(bpm: bpm, timeSignature: timeSignature)
         if resetPlayhead {
             playheadSeconds = regionStartSeconds
+            // Freeze displayTick until jump/seek re-anchors — the still-running players carry
+            // the old region's sample clock, which must not overwrite the new region playhead
+            // between advanceRegion and continueRecording.
+            if isPlaying || isRecording {
+                playbackStartedOffset = regionStartSeconds
+                playbackStartedHostTime = nil
+                transportReanchorPending = true
+            }
         }
     }
 
@@ -684,21 +797,16 @@ final class AudioEngineManager: ObservableObject {
         guard transportActive, !isCountingIn else { return }
 
         instrumentalPlayer.stop()
+        metronomePlayer.stop()
         stopClipPlayers()
         guard ensureEngineRunning() else { return }
         scheduleInstrumentalSegment(at: playheadSeconds)
         let count = scheduleClips(at: playheadSeconds)
-        instrumentalPlayer.play()
-        startClipPlayers(count: count)
-        if metronomeEnabled, !metronomePlayer.isPlaying {
-            metronomePlayer.play()
-        }
-        lastMetronomeBeat = -1
+        scheduleMetronomeClicks(from: playheadSeconds)
+        let startHost = startTransportPlayers(clipCount: count, at: playheadSeconds)
         loopBoundaryArmed = true
-        playbackStartedOffset = playheadSeconds
-        playbackStartedHostTime = mach_absolute_time()
         // Start mic writes only once the musical clock is running (avoids pre-roll silence).
-        armRecordingWritesAlignedToClock()
+        armRecordingWritesAlignedToClock(atHostTime: startHost)
         if isRecording {
             applyDesiredMonitor()
         }
@@ -712,38 +820,59 @@ final class AudioEngineManager: ObservableObject {
         seekPlayhead(to: playheadSeconds)
     }
 
-    /// Keep+Next while armed: jump to the new region start without tearing down clip players
-    /// under a live mic (full seek/rebuild causes monitor static).
+    /// Region navigation while playing (not armed): make the audio follow the region jump.
+    /// `setActiveRegion(resetPlayhead: true)` freezes the display clock expecting a re-anchor;
+    /// this is that re-anchor for the play-only path.
+    func resyncPlaybackToRegionStartIfPlaying() {
+        guard isPlaying, !isRecording, !isCountingIn else { return }
+        seekPlayhead(to: regionStartSeconds, clampToLoop: false)
+    }
+
+    /// Keep+Next while armed: jump to the new region start and lock overdub cues to the record clock.
     func continueRecordingAtRegionStart() {
         jumpToRegionStartPreservingPlayback(armRecordingOnStart: true)
         applyDesiredMonitor()
     }
 
-    /// Restart the musical clock at region start without `play()`'s full player teardown.
-    /// Used when re-arming over a kept take while transport is already running.
+    /// Restart the musical clock at region start and reschedule instrumental + other-track clips
+    /// so overdub cues share the same zero as mic write-arm. Ducks the monitor briefly (like `play()`)
+    /// so clip rebuild under a live mic does not inject static into the take.
     func jumpToRegionStartPreservingPlayback(armRecordingOnStart: Bool = false) {
+        let handoffStart = mach_absolute_time()
         playheadSeconds = regionStartSeconds
+        let restoreMonitor = isRecording || desiredMonitorEnabled || wantsInputMetering
+            || vocalMonitorMixer.outputVolume > 0.001
+        if restoreMonitor {
+            vocalMonitorMixer.outputVolume = 0
+        }
+
         instrumentalPlayer.stop()
-        guard ensureEngineRunning() else { return }
+        metronomePlayer.stop()
+        stopClipPlayers()
+        guard ensureEngineRunning() else {
+            if restoreMonitor { applyDesiredMonitor() }
+            return
+        }
         scheduleInstrumentalSegment(at: playheadSeconds)
-        if !instrumentalPlayer.isPlaying {
-            instrumentalPlayer.play()
-        }
-        if metronomeEnabled, !metronomePlayer.isPlaying {
-            metronomePlayer.play()
-        }
-        lastMetronomeBeat = -1
+        let clipCount = scheduleClips(at: playheadSeconds)
+        scheduleMetronomeClicks(from: playheadSeconds)
+        let startHost = startTransportPlayers(clipCount: clipCount, at: playheadSeconds)
         loopBoundaryArmed = true
         suppressLoopWrapUntilStop = false
-        playbackStartedOffset = playheadSeconds
-        playbackStartedHostTime = mach_absolute_time()
         isPlaying = true
         if armRecordingOnStart {
-            armRecordingWritesAlignedToClock()
+            armRecordingWritesAlignedToClock(atHostTime: startHost)
+        }
+        if restoreMonitor || isRecording {
+            applyDesiredMonitor()
         }
         if displayLink == nil {
             startDisplayLink()
         }
+        let handoffMs = Self.hostTimeToSeconds(mach_absolute_time() &- handoffStart) * 1000
+        Self.transportLog.info(
+            "region jump: start=\(self.regionStartSeconds, format: .fixed(precision: 3))s clips=\(clipCount) arm=\(armRecordingOnStart) handoff=\(handoffMs, format: .fixed(precision: 1))ms"
+        )
     }
 
     /// Scrub playhead freely (not clamped to the loop). While playing, disables loop wrap for this run.
@@ -752,6 +881,47 @@ final class AudioEngineManager: ObservableObject {
             suppressLoopWrapUntilStop = true
         }
         seekPlayhead(to: seconds, clampToLoop: false)
+    }
+
+    /// Start a ruler drag: freeze audio clock and stop players if playing (one resync on end).
+    func beginPlayheadScrub() {
+        guard !isPlayheadScrubbing else { return }
+        isPlayheadScrubbing = true
+        playheadScrubClampToLoop = false
+        // Playing (not recording): stop players and freeze the clock; one seek on finger-up.
+        if isPlaying, !isRecording {
+            resumePlaybackAfterPlayheadScrub = true
+            suppressLoopWrapUntilStop = true
+            instrumentalPlayer.stop()
+            metronomePlayer.stop()
+            stopClipPlayers()
+            playbackStartedHostTime = nil
+            return
+        }
+        // Recording or idle: move playhead during drag; seek once on end if transport is live.
+        resumePlaybackAfterPlayheadScrub = isPlaying || isRecording
+    }
+
+    /// Move playhead during a scrub drag without rebuilding players.
+    func updatePlayheadScrub(to seconds: Double, clampToLoop: Bool = false) {
+        playheadScrubClampToLoop = clampToLoop
+        var target = max(0, seconds)
+        if clampToLoop, loopEnabled, regionDurationSeconds > 0 {
+            let regionEnd = regionStartSeconds + regionDurationSeconds
+            target = min(max(target, regionStartSeconds), max(regionStartSeconds, regionEnd - 0.001))
+        }
+        playheadSeconds = target
+    }
+
+    /// Finish scrub drag — one seek/resync if transport was live.
+    func endPlayheadScrub() {
+        guard isPlayheadScrubbing else { return }
+        isPlayheadScrubbing = false
+        let shouldResume = resumePlaybackAfterPlayheadScrub
+        resumePlaybackAfterPlayheadScrub = false
+        if shouldResume, isPlaying || isRecording, !isCountingIn {
+            seekPlayhead(to: playheadSeconds, clampToLoop: playheadScrubClampToLoop)
+        }
     }
 
     func setLoopBoundaryHandler(_ handler: (() -> Void)?) {
@@ -788,7 +958,7 @@ final class AudioEngineManager: ObservableObject {
 
         scheduleInstrumentalSegment(at: playheadSeconds)
         let scheduledClipCount = scheduleClips(at: playheadSeconds)
-        scheduleMetronomeIfNeeded()
+        scheduleMetronomeClicks(from: playheadSeconds)
 
         guard ensureEngineRunning() else {
             if restoreMonitor { applyDesiredMonitor() }
@@ -799,22 +969,15 @@ final class AudioEngineManager: ObservableObject {
             )
         }
 
-        instrumentalPlayer.play()
-        startClipPlayers(count: scheduledClipCount)
-        if metronomeEnabled {
-            metronomePlayer.play()
-        }
+        let startHost = startTransportPlayers(clipCount: scheduledClipCount, at: playheadSeconds)
 
         isPlaying = true
         isCountingIn = false
-        lastMetronomeBeat = -1
         loopBoundaryArmed = true
         suppressLoopWrapUntilStop = false
-        playbackStartedOffset = playheadSeconds
-        playbackStartedHostTime = mach_absolute_time()
         // Start mic writes only once the musical clock is running (avoids pre-roll silence).
         if armRecordingOnStart {
-            armRecordingWritesAlignedToClock()
+            armRecordingWritesAlignedToClock(atHostTime: startHost)
         }
         // Re-assert monitor after player churn / session work.
         if restoreMonitor || isRecording {
@@ -832,6 +995,9 @@ final class AudioEngineManager: ObservableObject {
         isCountingIn = false
         loopBoundaryArmed = false
         suppressLoopWrapUntilStop = false
+        isPlayheadScrubbing = false
+        resumePlaybackAfterPlayheadScrub = false
+        transportReanchorPending = false
         playbackStartedHostTime = nil
         // Keep the display link for tap metering when Input Monitor / meter is still armed.
         if wantsInputMetering || desiredMonitorEnabled || inputTapInstalled {
@@ -848,6 +1014,7 @@ final class AudioEngineManager: ObservableObject {
         if !desiredMonitorEnabled && !wantsInputMetering {
             releaseCaptureHold()
         }
+        flushPendingClipHardRefreshIfNeeded()
     }
 
     /// Stop transport and leave the playhead where it is (VM seeks after).
@@ -870,7 +1037,7 @@ final class AudioEngineManager: ObservableObject {
         for i in clipPlayers.indices {
             clipPlayers[i].stop()
             clipPlayers[i].volume = 1
-            clipPlayerSourceURLs[i] = nil
+            clipPlayerScheduledClips[i] = nil
         }
     }
 
@@ -885,10 +1052,39 @@ final class AudioEngineManager: ObservableObject {
         }
     }
 
-    private func audioFile(for url: URL) -> AVAudioFile? {
-        if let cached = clipFileCache[url] { return cached }
+    /// Lead before the shared player start — must exceed one render quantum so `play(at:)`
+    /// lands on a future render cycle for every player.
+    private static let transportStartLeadSeconds: TimeInterval = 0.03
+
+    /// Start instrumental + scheduled clip players + metronome at ONE shared host time.
+    /// Bare `play()` starts each node at the render cycle after that call, so a sequential
+    /// start shifts the metronome 1+ quanta behind the bed once clip players sit in between
+    /// (clicks audibly late whenever recordings play, worse with more clips). A shared
+    /// `play(at:)` gives every player-relative schedule the exact same sample zero, and the
+    /// playhead clock is anchored to that same instant. Returns the shared start host time.
+    @discardableResult
+    private func startTransportPlayers(clipCount: Int, at timelineSeconds: Double) -> UInt64 {
+        let startHost = mach_absolute_time() &+ Self.secondsToHostTicks(Self.transportStartLeadSeconds)
+        let when = AVAudioTime(hostTime: startHost)
+        instrumentalPlayer.play(at: when)
+        let n = min(clipCount, clipPlayers.count)
+        for i in 0..<n where !clipPlayers[i].isPlaying {
+            clipPlayers[i].play(at: when)
+        }
+        metronomePlayer.play(at: when)
+        anchorPlaybackClock(at: timelineSeconds, hostTime: startHost)
+        Self.transportLog.debug(
+            "shared start: t=\(timelineSeconds, format: .fixed(precision: 3))s lead=\(Self.transportStartLeadSeconds * 1000, format: .fixed(precision: 0))ms clips=\(n)"
+        )
+        return startHost
+    }
+
+    private func audioFile(for url: URL, playerIndex: Int) -> AVAudioFile? {
+        if let cached = clipFileCache[playerIndex], cached.url == url {
+            return cached.file
+        }
         guard let file = try? AVAudioFile(forReading: url) else { return nil }
-        clipFileCache[url] = file
+        clipFileCache[playerIndex] = (url, file)
         return file
     }
 
@@ -898,7 +1094,7 @@ final class AudioEngineManager: ObservableObject {
         var playerIndex = 0
         for clip in scheduledClips {
             guard playerIndex < clipPlayers.count else { break }
-            guard let file = audioFile(for: clip.url) else { continue }
+            guard let file = audioFile(for: clip.url, playerIndex: playerIndex) else { continue }
             let rate = file.processingFormat.sampleRate
             let fileDuration = Double(file.length) / rate
             guard fileDuration > 0.001, file.length > 0 else { continue }
@@ -938,7 +1134,7 @@ final class AudioEngineManager: ObservableObject {
 
             player.volume = max(0, min(1, clip.gain))
             player.pan = max(-1, min(1, clip.pan))
-            clipPlayerSourceURLs[playerIndex] = clip.url
+            clipPlayerScheduledClips[playerIndex] = clip
             player.scheduleSegment(
                 file,
                 startingFrame: startFrame,
@@ -989,7 +1185,7 @@ final class AudioEngineManager: ObservableObject {
         let frameCount = AVAudioFrameCount(min(playSeconds * rate, Double(file.length - startFrame)))
         guard frameCount > 0 else { return }
 
-        // Loop timing is driven by host-time in displayTick — no completion handler.
+        // Player-relative time (nil = now when play() starts). Absolute render times mute stopped nodes.
         let delay = audibleStart - timelineSeconds
         let when: AVAudioTime?
         if delay > 0.001 {
@@ -1022,19 +1218,15 @@ final class AudioEngineManager: ObservableObject {
             playheadSeconds = regionStartSeconds
             onLoopBoundary?()
             instrumentalPlayer.stop()
+            metronomePlayer.stop()
             stopClipPlayers()
             guard ensureEngineRunning() else { return }
             scheduleInstrumentalSegment(at: regionStartSeconds)
             let count = scheduleClips(at: regionStartSeconds)
-            if !instrumentalPlayer.isPlaying {
-                instrumentalPlayer.play()
-            }
-            startClipPlayers(count: count)
-            lastMetronomeBeat = -1
+            scheduleMetronomeClicks(from: regionStartSeconds)
+            let startHost = startTransportPlayers(clipCount: count, at: regionStartSeconds)
             loopBoundaryArmed = true
-            playbackStartedOffset = regionStartSeconds
-            playbackStartedHostTime = mach_absolute_time()
-            armRecordingWritesAlignedToClock()
+            armRecordingWritesAlignedToClock(atHostTime: startHost)
             if isRecording {
                 applyDesiredMonitor()
             }
@@ -1046,6 +1238,10 @@ final class AudioEngineManager: ObservableObject {
     // MARK: - Metronome / Count-in
 
     private var clickBuffer: AVAudioPCMBuffer?
+    /// Louder copy of `clickBuffer` for downbeats (per-buffer level; player volume is global).
+    private var accentClickBuffer: AVAudioPCMBuffer?
+    /// Bound on pre-scheduled clicks per transport start (~8.5 min at 120 BPM).
+    private static let maxScheduledClicks = 1024
 
     private func ensureClickBuffer() {
         let playerFormat = metronomePlayer.outputFormat(forBus: 0)
@@ -1064,11 +1260,62 @@ final class AudioEngineManager: ObservableObject {
         }
 
         clickBuffer = AudioNodeFactory.makeClickBuffer(sampleRate: rate, channels: channels)
+        accentClickBuffer = nil
     }
 
-    private func scheduleMetronomeIfNeeded() {
+    private func accentBuffer(matching click: AVAudioPCMBuffer) -> AVAudioPCMBuffer {
+        if let existing = accentClickBuffer,
+           existing.format.channelCount == click.format.channelCount,
+           abs(existing.format.sampleRate - click.format.sampleRate) < 1 {
+            return existing
+        }
+        guard let copy = AVAudioPCMBuffer(pcmFormat: click.format, frameCapacity: click.frameLength) else {
+            return click
+        }
+        copy.frameLength = click.frameLength
+        for ch in 0..<Int(click.format.channelCount) {
+            guard let src = click.floatChannelData?[ch], let dst = copy.floatChannelData?[ch] else { continue }
+            for i in 0..<Int(click.frameLength) {
+                dst[i] = max(-1, min(1, src[i] * 1.6))
+            }
+        }
+        accentClickBuffer = copy
+        return copy
+    }
+
+    /// Pre-schedule clicks on the metronome player's sample timeline so they share the exact
+    /// zero of the bed/clip schedules. Display-link clicks drift under main-thread load —
+    /// which grows with kept clips/autosaves and made later phrases progressively late.
+    /// Always scheduled; enable/disable is a mixer mute so toggling never touches transport.
+    private func scheduleMetronomeClicks(from timelineSeconds: Double) {
         ensureClickBuffer()
-        // Metronome clicks are driven from display link for simplicity in V1.
+        guard let click = clickBuffer else { return }
+        let beatDuration = TimelineManager.secondsPerBeat(bpm: bpm)
+        guard beatDuration > 0.001 else { return }
+        let windowEnd = playbackWindowEnd
+        guard windowEnd > timelineSeconds + 0.001 else { return }
+        let playerRate = metronomePlayer.outputFormat(forBus: 0).sampleRate
+        let rate = playerRate > 0 ? playerRate : click.format.sampleRate
+        guard rate > 0 else { return }
+        let accent = accentBuffer(matching: click)
+        let beatsPerBar = max(1, timeSignature.beatsPerBar)
+
+        // First beat at or after the start position (a beat exactly on it plays immediately).
+        var beatIndex = Int(((timelineSeconds - 0.000_5) / beatDuration).rounded(.up))
+        beatIndex = max(0, beatIndex)
+        var scheduled = 0
+        while scheduled < Self.maxScheduledClicks {
+            let beatTime = Double(beatIndex) * beatDuration
+            if beatTime >= windowEnd - 0.000_5 { break }
+            let delay = beatTime - timelineSeconds
+            let when: AVAudioTime? = delay > 0.000_5
+                ? AVAudioTime(sampleTime: AVAudioFramePosition(delay * rate), atRate: rate)
+                : nil
+            let buffer = beatIndex % beatsPerBar == 0 ? accent : click
+            metronomePlayer.scheduleBuffer(buffer, at: when, options: [], completionHandler: nil)
+            beatIndex += 1
+            scheduled += 1
+        }
     }
 
     func startCountIn(beats: Int, completion: @escaping () -> Void) throws {
@@ -1079,9 +1326,10 @@ final class AudioEngineManager: ObservableObject {
         isPlaying = true
         playheadSeconds = regionStartSeconds
         onCountInFinished = completion
-        playbackStartedOffset = 0
-        playbackStartedHostTime = mach_absolute_time()
-        setMetronomeVolume(true)
+        anchorPlaybackClock(at: 0)
+        // Count-in must be audible even with metro off — unmute the mixer directly so the
+        // user's metronome preference is restored (not overwritten) when the take starts.
+        metronomeMixer.outputVolume = 0.55
         startDisplayLink()
         ensureClickBuffer()
     }
@@ -1130,7 +1378,7 @@ final class AudioEngineManager: ObservableObject {
 
         if FileManager.default.fileExists(atPath: url.path) {
             // Release any cached readers before overwriting a deleted take's path.
-            clipFileCache.removeValue(forKey: url)
+            clipFileCache = clipFileCache.filter { $0.value.url != url }
             try FileManager.default.removeItem(at: url)
         }
         recordingFile = try AVAudioFile(forWriting: url, settings: fileFormat.settings)
@@ -1181,15 +1429,27 @@ final class AudioEngineManager: ObservableObject {
         recordingWriteEnabled = false
     }
 
-    /// Enable mic file writes aligned to the current host clock (and refresh latency stamp).
-    func armRecordingWritesAlignedToClock() {
+    /// Enable mic file writes aligned to the musical clock (and refresh latency stamp).
+    /// Pass the shared player-start host time so WAV sample 0 trims to the audible zero.
+    func armRecordingWritesAlignedToClock(atHostTime hostTime: UInt64? = nil) {
         guard isRecording, recordingFile != nil else { return }
         // Lead-in: keep writes gated until the playhead reaches the loop region.
         if onRecordingPunchIn != nil, playheadSeconds < regionStartSeconds - 0.0001 {
             return
         }
         activeRecordingLatencySeconds = roundTripLatencySeconds
+        recordingWriteSkewSeconds = -1
+        recordingArmHostTime = hostTime ?? mach_absolute_time()
         recordingWriteEnabled = true
+        let anchorToArmMs: Double
+        if let anchor = playbackStartedHostTime, recordingArmHostTime >= anchor {
+            anchorToArmMs = Self.hostTimeToSeconds(recordingArmHostTime &- anchor) * 1000
+        } else {
+            anchorToArmMs = -1
+        }
+        Self.transportLog.info(
+            "arm writes: latency=\(self.activeRecordingLatencySeconds * 1000, format: .fixed(precision: 1))ms anchor→arm=\(anchorToArmMs, format: .fixed(precision: 2))ms"
+        )
         if let punch = onRecordingPunchIn {
             onRecordingPunchIn = nil
             punch()
@@ -1229,6 +1489,7 @@ final class AudioEngineManager: ObservableObject {
         if !wantsInputMetering {
             inputLevel = 0
         }
+        flushPendingClipHardRefreshIfNeeded()
     }
 
     private func syncInputTap() {
@@ -1251,12 +1512,29 @@ final class AudioEngineManager: ObservableObject {
 
         // Tap splitter (not inputNode) so hardware passthrough stays audible.
         // No MainActor hops from this callback — they glitch monitor + WAV together.
-        micSplitter.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+        micSplitter.installTap(onBus: 0, bufferSize: Self.recordingTapBufferFrames, format: format) { [weak self] buffer, when in
             guard let self else { return }
             self.tapPeakLevel = Self.bufferPeakLevel(buffer)
             if self.recordingWriteEnabled {
-                Self.writeRecordingBuffer(
-                    buffer,
+                var outBuffer = buffer
+                let isFirstWrite = self.recordingWriteSkewSeconds < 0 && self.recordingArmHostTime != 0
+                if isFirstWrite {
+                    // Align WAV sample 0 to the arm instant: drop frames captured before arm.
+                    // Without this every region starts up to one tap quantum early/late and
+                    // Keep placement varies region to region.
+                    guard let trimmed = Self.bufferTrimmedToArm(
+                        buffer,
+                        capturedAt: when,
+                        armHostTime: self.recordingArmHostTime
+                    ) else {
+                        return // Entire buffer predates arm — wait for the next one.
+                    }
+                    outBuffer = trimmed
+                    let delta = mach_absolute_time() &- self.recordingArmHostTime
+                    self.recordingWriteSkewSeconds = Self.hostTimeToSeconds(delta)
+                }
+                _ = Self.writeRecordingBuffer(
+                    outBuffer,
                     file: self.recordingFileForTap,
                     converter: self.recordingConverter,
                     writeFormat: self.recordingWriteFormat
@@ -1283,20 +1561,69 @@ final class AudioEngineManager: ObservableObject {
         smoothInputLevel(tapPeakLevel)
     }
 
+    /// First tap buffer after write-arm: drop frames captured before the arm instant so the
+    /// file's sample 0 corresponds to the musical zero. Returns nil when the entire buffer
+    /// predates arm (caller waits for the next one); returns the input unchanged when the
+    /// capture timestamp is unavailable or no trim is needed.
+    private nonisolated static func bufferTrimmedToArm(
+        _ buffer: AVAudioPCMBuffer,
+        capturedAt when: AVAudioTime,
+        armHostTime: UInt64
+    ) -> AVAudioPCMBuffer? {
+        guard when.isHostTimeValid else { return buffer }
+        let rate = buffer.format.sampleRate
+        let frames = buffer.frameLength
+        guard rate > 0, frames > 0 else { return buffer }
+        guard armHostTime > when.hostTime else { return buffer }
+        let aheadSeconds = hostTimeToSeconds(armHostTime &- when.hostTime)
+        let dropFrames = AVAudioFrameCount(min(Double(frames), (aheadSeconds * rate).rounded()))
+        guard dropFrames > 0 else { return buffer }
+        guard dropFrames < frames else { return nil }
+        let keepFrames = frames - dropFrames
+        guard let trimmed = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: keepFrames) else {
+            return buffer
+        }
+        trimmed.frameLength = keepFrames
+        let channels = Int(buffer.format.channelCount)
+        if buffer.format.isInterleaved {
+            let offset = Int(dropFrames) * channels
+            let count = Int(keepFrames) * channels
+            if let src = buffer.floatChannelData?[0], let dst = trimmed.floatChannelData?[0] {
+                dst.update(from: src + offset, count: count)
+            } else if let src = buffer.int16ChannelData?[0], let dst = trimmed.int16ChannelData?[0] {
+                dst.update(from: src + offset, count: count)
+            } else {
+                return buffer
+            }
+        } else {
+            for ch in 0..<channels {
+                if let src = buffer.floatChannelData?[ch], let dst = trimmed.floatChannelData?[ch] {
+                    dst.update(from: src + Int(dropFrames), count: Int(keepFrames))
+                } else if let src = buffer.int16ChannelData?[ch], let dst = trimmed.int16ChannelData?[ch] {
+                    dst.update(from: src + Int(dropFrames), count: Int(keepFrames))
+                } else {
+                    return buffer
+                }
+            }
+        }
+        return trimmed
+    }
+
+    @discardableResult
     private nonisolated static func writeRecordingBuffer(
         _ buffer: AVAudioPCMBuffer,
         file: AVAudioFile?,
         converter: AVAudioConverter?,
         writeFormat: AVAudioFormat?,
         onError: (String) -> Void
-    ) {
-        guard let file else { return }
+    ) -> Bool {
+        guard let file, buffer.frameLength > 0 else { return false }
         do {
             if let converter, let writeFormat {
                 guard let outBuffer = AVAudioPCMBuffer(
                     pcmFormat: writeFormat,
                     frameCapacity: buffer.frameLength
-                ) else { return }
+                ) else { return false }
                 var error: NSError?
                 var provided = false
                 let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
@@ -1311,14 +1638,16 @@ final class AudioEngineManager: ObservableObject {
                 converter.convert(to: outBuffer, error: &error, withInputFrom: inputBlock)
                 if let error {
                     onError(error.localizedDescription)
-                    return
+                    return false
                 }
                 try file.write(from: outBuffer)
             } else {
                 try file.write(from: buffer)
             }
+            return true
         } catch {
             onError(error.localizedDescription)
+            return false
         }
     }
 
@@ -1360,6 +1689,43 @@ final class AudioEngineManager: ObservableObject {
 
     // MARK: - Display link playhead
 
+    /// Anchor playhead/metro to the moment players start (matches player-relative schedules).
+    /// Pass the shared `play(at:)` host time so the display clock equals the audible start.
+    private func anchorPlaybackClock(at timelineSeconds: Double, hostTime: UInt64? = nil) {
+        playbackStartedOffset = timelineSeconds
+        playbackStartedHostTime = hostTime ?? mach_absolute_time()
+        transportReanchorPending = false
+        Self.transportLog.debug("anchor: t=\(timelineSeconds, format: .fixed(precision: 3))s")
+    }
+
+    /// Elapsed seconds on the audio sample clock from a running player (resets to ~0 after each play/seek).
+    private func playerTransportElapsedSeconds() -> Double? {
+        let candidates: [AVAudioPlayerNode] = [instrumentalPlayer] + clipPlayers + [metronomePlayer]
+        for player in candidates {
+            guard player.isPlaying,
+                  let nodeTime = player.lastRenderTime,
+                  nodeTime.isSampleTimeValid,
+                  let playerTime = player.playerTime(forNodeTime: nodeTime),
+                  playerTime.isSampleTimeValid,
+                  playerTime.sampleRate > 0,
+                  playerTime.sampleTime >= 0
+            else { continue }
+            return Double(playerTime.sampleTime) / playerTime.sampleRate
+        }
+        return nil
+    }
+
+    /// Elapsed transport seconds since the playback anchor (prefer audio player time).
+    private func transportElapsedSeconds() -> Double? {
+        if let audioElapsed = playerTransportElapsedSeconds() {
+            return audioElapsed
+        }
+        guard let start = playbackStartedHostTime else { return nil }
+        let now = mach_absolute_time()
+        guard now >= start else { return 0 }
+        return Self.hostTimeToSeconds(now &- start)
+    }
+
     private func startDisplayLink() {
         displayLink?.invalidate()
         let link = CADisplayLink(target: DisplayLinkProxy(owner: self), selector: #selector(DisplayLinkProxy.tick))
@@ -1369,8 +1735,10 @@ final class AudioEngineManager: ObservableObject {
 
     fileprivate func displayTick() {
         publishTapMetering()
-        guard let start = playbackStartedHostTime else { return }
-        let elapsed = hostTimeToSeconds(mach_absolute_time() - start)
+        // A ruler scrub owns the playhead, and a region jump must not derive a position from
+        // the old players' sample clock before the handoff re-anchors.
+        if isPlayheadScrubbing || transportReanchorPending { return }
+        guard let elapsed = transportElapsedSeconds() else { return }
 
         if isCountingIn {
             let beatDuration = TimelineManager.secondsPerBeat(bpm: bpm)
@@ -1382,6 +1750,8 @@ final class AudioEngineManager: ObservableObject {
             if elapsed >= Double(countInBeatsRemaining) * beatDuration {
                 isCountingIn = false
                 lastMetronomeBeat = -1
+                // Count-in unmuted the click mixer directly; restore the user's preference.
+                setMetronomeVolume(metronomeEnabled)
                 let finish = onCountInFinished
                 onCountInFinished = nil
                 playbackStartedHostTime = nil
@@ -1427,15 +1797,8 @@ final class AudioEngineManager: ObservableObject {
                     return
                 }
             }
-
-            if metronomeEnabled, isPlaying || isRecording {
-                let beatDuration = TimelineManager.secondsPerBeat(bpm: bpm)
-                let globalBeat = Int(playheadSeconds / beatDuration)
-                if globalBeat != lastMetronomeBeat {
-                    lastMetronomeBeat = globalBeat
-                    fireClick(accent: globalBeat % timeSignature.beatsPerBar == 0)
-                }
-            }
+            // Metronome clicks are pre-scheduled on the player sample timeline (see
+            // scheduleMetronomeClicks) — no display-link clicks during play/record.
         }
     }
 
@@ -1465,11 +1828,18 @@ final class AudioEngineManager: ObservableObject {
         }
     }
 
-    private func hostTimeToSeconds(_ delta: UInt64) -> Double {
+    private nonisolated static func hostTimeToSeconds(_ delta: UInt64) -> Double {
         var info = mach_timebase_info_data_t()
         mach_timebase_info(&info)
         let nanos = Double(delta) * Double(info.numer) / Double(info.denom)
         return nanos / 1_000_000_000
+    }
+
+    private nonisolated static func secondsToHostTicks(_ seconds: TimeInterval) -> UInt64 {
+        var info = mach_timebase_info_data_t()
+        mach_timebase_info(&info)
+        let nanos = max(0, seconds) * 1_000_000_000
+        return UInt64(nanos * Double(info.denom) / Double(info.numer))
     }
 }
 

@@ -113,32 +113,15 @@ struct ContentView: View {
     private var bottomTransportBar: some View {
         let scrubDisabled = vm.recording.phase != .idle
         return VStack(spacing: 10) {
-            HStack(spacing: 12) {
-                bottomBarButton(
-                    title: vm.recording.phase == .idle ? "Record" : "Stop",
-                    fill: vm.recording.phase == .idle ? AppTheme.record : AppTheme.surfaceElevated,
-                    foreground: vm.recording.phase == .idle ? .white : AppTheme.textPrimary
-                ) {
-                    vm.toggleRecord()
-                }
-                bottomBarButton(title: "Keep + Next", fill: AppTheme.surfaceElevated, foreground: AppTheme.textPrimary) {
-                    vm.handleControllerAction(.keepTakeAndNext)
-                }
-            }
-            HStack(spacing: 12) {
-                bottomBarButton(title: "Keep Take", fill: AppTheme.accent, foreground: .black) {
-                    vm.handleControllerAction(.keepTake)
-                }
-                bottomBarButton(
-                    title: "Lead In",
+            HStack(spacing: 8) {
+                HoldRepeatIconButton(
+                    systemName: "chevron.backward.2",
                     fill: AppTheme.surfaceElevated,
                     foreground: AppTheme.textPrimary,
                     disabled: scrubDisabled
                 ) {
-                    vm.handleControllerAction(.leadIn)
+                    vm.nudgePlayhead(byBars: -vm.project.regionLength.rawValue)
                 }
-            }
-            HStack(spacing: 12) {
                 HoldRepeatIconButton(
                     systemName: "chevron.backward",
                     fill: AppTheme.surfaceElevated,
@@ -161,6 +144,14 @@ struct ContentView: View {
                     disabled: scrubDisabled
                 ) {
                     vm.nudgePlayhead(byBars: 1)
+                }
+                HoldRepeatIconButton(
+                    systemName: "chevron.forward.2",
+                    fill: AppTheme.surfaceElevated,
+                    foreground: AppTheme.textPrimary,
+                    disabled: scrubDisabled
+                ) {
+                    vm.nudgePlayhead(byBars: vm.project.regionLength.rawValue)
                 }
             }
             HStack(spacing: 12) {
@@ -203,6 +194,14 @@ struct ContentView: View {
                     disabled: scrubDisabled
                 ) {
                     vm.nudgeLoopSelection(byBars: 1)
+                }
+            }
+            HStack(spacing: 12) {
+                bottomBarButton(title: "Keep Take", fill: AppTheme.accent, foreground: .black) {
+                    vm.handleControllerAction(.keepTake)
+                }
+                bottomBarButton(title: "Keep + Next", fill: AppTheme.surfaceElevated, foreground: AppTheme.textPrimary) {
+                    vm.handleControllerAction(.keepTakeAndNext)
                 }
             }
         }
